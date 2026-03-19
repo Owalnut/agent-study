@@ -60,25 +60,15 @@ public class WorkflowService {
     }
 
     public Map<String, Object> getDefaultWorkflow() {
-        WorkflowDefinitionEntity entity = definitionMapper.selectOne(
-                new LambdaQueryWrapper<WorkflowDefinitionEntity>().eq(WorkflowDefinitionEntity::getIsPublished, 1).last("limit 1")
+        return Map.of(
+                "nodes", List.of(
+                        Map.of("id", "input-default", "type", "input", "data", Map.of("name", "输入")),
+                        Map.of("id", "output-default", "type", "output", "data", Map.of("name", "输出"))
+                ),
+                "edges", List.of(
+                        Map.of("id", "e1", "source", "input-default", "target", "output-default")
+                )
         );
-        if (entity == null) {
-            return Map.of(
-                    "nodes", List.of(
-                            Map.of("id", "input-default", "type", "input", "data", Map.of("name", "输入")),
-                            Map.of("id", "llm-default", "type", "llm", "data", Map.of("name", "通义千问", "model", "qwen-turbo")),
-                            Map.of("id", "tts-default", "type", "tool_tts", "data", Map.of("name", "超拟人音频合成", "voice", "alloy")),
-                            Map.of("id", "output-default", "type", "output", "data", Map.of("name", "输出"))
-                    ),
-                    "edges", List.of(
-                            Map.of("id", "e1", "source", "input-default", "target", "llm-default"),
-                            Map.of("id", "e2", "source", "llm-default", "target", "tts-default"),
-                            Map.of("id", "e3", "source", "tts-default", "target", "output-default")
-                    )
-            );
-        }
-        return readJson(entity.getWorkflowJson());
     }
 
     public WorkflowDtos.DebugWorkflowResponse debugWorkflow(WorkflowDtos.DebugWorkflowRequest req) {

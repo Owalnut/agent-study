@@ -154,6 +154,7 @@ body,
   border-radius: 8px;
   padding: 10px;
   font-size: 14px;
+  width: 100%;
 }
 
 .config-row {
@@ -186,6 +187,60 @@ body,
   background: #2f6dff;
   padding: 10px 14px;
   cursor: pointer;
+}
+
+.add-param-btn {
+  justify-self: start;
+  border: 1px solid #d8dff1;
+  border-radius: 8px;
+  background: #fff;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+
+.output-table {
+  display: grid;
+  gap: 8px;
+}
+
+.output-row {
+  display: grid;
+  grid-template-columns: 1fr 110px 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.inline-input {
+  padding: 8px;
+  min-height: 38px;
+}
+
+.remove-btn {
+  border: none;
+  border-radius: 8px;
+  background: #fbe9eb;
+  color: #b42318;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.template-help {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.required-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #2f3b52;
+  font-size: 14px;
+}
+
+.required-row input {
+  width: 16px;
+  height: 16px;
 }
 
 .hint {

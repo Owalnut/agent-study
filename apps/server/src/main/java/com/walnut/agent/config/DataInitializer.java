@@ -22,14 +22,10 @@ public class DataInitializer {
                     {
                       "nodes": [
                         {"id": "input-default", "type": "input", "data": {"name": "输入"}},
-                        {"id": "llm-default", "type": "llm", "data": {"name": "通义千问", "model": "qwen-turbo"}},
-                        {"id": "tts-default", "type": "tool_tts", "data": {"name": "超拟人音频合成", "voice": "alloy"}},
                         {"id": "output-default", "type": "output", "data": {"name": "输出"}}
                       ],
                       "edges": [
-                        {"id": "e1", "source": "input-default", "target": "llm-default"},
-                        {"id": "e2", "source": "llm-default", "target": "tts-default"},
-                        {"id": "e3", "source": "tts-default", "target": "output-default"}
+                        {"id": "e1", "source": "input-default", "target": "output-default"}
                       ]
                     }
                     """);

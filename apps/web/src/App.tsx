@@ -11,6 +11,8 @@ type WorkflowEdge = { id: string; source: string; target: string };
 type Workflow = { nodes: WorkflowNodeMeta[]; edges: WorkflowEdge[] };
 type DebugOutput = { text?: string; audioBase64?: string; contentType?: string };
 type WsEvent = { type: string; executionId?: number; payload?: Record<string, unknown> };
+type OutputParamType = "input" | "reference";
+type OutputParam = { id: string; name: string; type: OutputParamType; value: string };
 
 type FlowNode = Node<{ label: string }, "default"> & { meta: WorkflowNodeMeta };
 
@@ -41,6 +43,8 @@ export default function App() {
   const [debugResult, setDebugResult] = useState<DebugOutput | null>(null);
   const [loading, setLoading] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
+  const [outputConfigs, setOutputConfigs] = useState<Record<string, OutputParam[]>>({});
+  const [outputTemplates, setOutputTemplates] = useState<Record<string, string>>({});
   const wsRef = useRef<WebSocket | null>(null);
   const flowRef = useRef<ReactFlowInstance | null>(null);
 
@@ -85,6 +89,19 @@ export default function App() {
     }),
     [nodes, edges]
   );
+
+  const selectedOutputParams = selectedNode && selectedNode.type === "output" ? outputConfigs[selectedNode.id] || [] : [];
+  const selectedOutputTemplate =
+    selectedNode && selectedNode.type === "output" ? outputTemplates[selectedNode.id] ?? "{{output}}" : "{{output}}";
+
+  const referenceOptions = useMemo(() => {
+    return nodes
+      .filter((n) => n.meta.type !== "output")
+      .flatMap((n) => [
+        { label: `${n.data.label}.text`, value: `${n.id}.text` },
+        { label: `${n.data.label}.audioBase64`, value: `${n.id}.audioBase64` }
+      ]);
+  }, [nodes]);
 
   async function handleDebug(): Promise<void> {
     if (!token) return;
@@ -149,6 +166,35 @@ export default function App() {
         meta
       }
     ]);
+  }
+
+  function addOutputParam(nodeId: string) {
+    const next: OutputParam = {
+      id: crypto.randomUUID().slice(0, 8),
+      name: "",
+      type: "input",
+      value: ""
+    };
+    setOutputConfigs((prev) => ({ ...prev, [nodeId]: [...(prev[nodeId] || []), next] }));
+  }
+
+  function updateOutputParam(nodeId: string, paramId: string, patch: Partial<OutputParam>) {
+    setOutputConfigs((prev) => ({
+      ...prev,
+      [nodeId]: (prev[nodeId] || []).map((item) => (item.id === paramId ? { ...item, ...patch } : item))
+    }));
+  }
+
+  function removeOutputParam(nodeId: string, paramId: string) {
+    setOutputConfigs((prev) => ({
+      ...prev,
+      [nodeId]: (prev[nodeId] || []).filter((item) => item.id !== paramId)
+    }));
+  }
+
+  function insertTemplateVar(nodeId: string, name: string) {
+    if (!name) return;
+    setOutputTemplates((prev) => ({ ...prev, [nodeId]: `${prev[nodeId] ?? ""}{{${name}}}` }));
   }
 
   function handleDragStart(event: DragEvent<HTMLButtonElement>, nodeTemplate: { type: NodeType; label: string }) {
@@ -234,15 +280,105 @@ export default function App() {
               <div className="config-input">{selectedNode.id}</div>
               <label className="config-label">节点类型</label>
               <div className="config-input">{selectedNode.type}</div>
-              <label className="config-label">输出配置</label>
-              <div className="config-row">
-                <span className="chip">output</span>
-                <span className="chip">引用</span>
-                <span className="chip">{selectedNode.data?.name || "字段"}</span>
-              </div>
-              <label className="config-label">回答内容配置</label>
-              <textarea className="config-area" value="{{output}}" readOnly />
-              <button className="save-config-btn">保存配置</button>
+              {selectedNode.type === "input" ? (
+                <>
+                  <label className="config-label">变量名</label>
+                  <div className="config-input">user_input</div>
+                  <label className="config-label">变量类型</label>
+                  <div className="config-input">String</div>
+                  <label className="config-label">描述</label>
+                  <div className="config-input">用户本轮的输入内容</div>
+                  <label className="config-label">是否必要</label>
+                  <label className="required-row">
+                    <input type="checkbox" checked readOnly />
+                    <span>必要</span>
+                  </label>
+                  <button className="save-config-btn">保存配置</button>
+                </>
+              ) : selectedNode.type === "output" ? (
+                <>
+                  <label className="config-label">输出配置</label>
+                  <button className="add-param-btn" onClick={() => addOutputParam(selectedNode.id)}>
+                    ＋ 添加
+                  </button>
+                  <div className="output-table">
+                    {selectedOutputParams.length === 0 ? (
+                      <div className="hint">暂无参数，点击“添加”创建</div>
+                    ) : (
+                      selectedOutputParams.map((item) => (
+                        <div className="output-row" key={item.id}>
+                          <input
+                            className="config-input inline-input"
+                            placeholder="参数名"
+                            value={item.name}
+                            onChange={(e) => updateOutputParam(selectedNode.id, item.id, { name: e.target.value })}
+                          />
+                          <select
+                            className="config-input inline-input"
+                            value={item.type}
+                            onChange={(e) =>
+                              updateOutputParam(selectedNode.id, item.id, { type: e.target.value as OutputParamType, value: "" })
+                            }
+                          >
+                            <option value="input">输入</option>
+                            <option value="reference">引用</option>
+                          </select>
+                          {item.type === "input" ? (
+                            <input
+                              className="config-input inline-input"
+                              placeholder="请输入值"
+                              value={item.value}
+                              onChange={(e) => updateOutputParam(selectedNode.id, item.id, { value: e.target.value })}
+                            />
+                          ) : (
+                            <select
+                              className="config-input inline-input"
+                              value={item.value}
+                              onChange={(e) => updateOutputParam(selectedNode.id, item.id, { value: e.target.value })}
+                            >
+                              <option value="">选择引用</option>
+                              {referenceOptions.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                          <button className="remove-btn" onClick={() => removeOutputParam(selectedNode.id, item.id)}>
+                            删除
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <label className="config-label">回答内容配置</label>
+                  <div className="template-help">
+                    {selectedOutputParams.map((item) => (
+                      <button key={item.id} className="chip" onClick={() => insertTemplateVar(selectedNode.id, item.name)}>
+                        {`{{${item.name || "参数名"}}}`}
+                      </button>
+                    ))}
+                  </div>
+                  <textarea
+                    className="config-area"
+                    value={selectedOutputTemplate}
+                    onChange={(e) => setOutputTemplates((prev) => ({ ...prev, [selectedNode.id]: e.target.value }))}
+                  />
+                  <button className="save-config-btn">保存配置</button>
+                </>
+              ) : (
+                <>
+                  <label className="config-label">输出配置</label>
+                  <div className="config-row">
+                    <span className="chip">output</span>
+                    <span className="chip">引用</span>
+                    <span className="chip">{selectedNode.data?.name || "字段"}</span>
+                  </div>
+                  <label className="config-label">回答内容配置</label>
+                  <textarea className="config-area" value="{{output}}" readOnly />
+                  <button className="save-config-btn">保存配置</button>
+                </>
+              )}
             </div>
           ) : (
             <p className="hint">点击画布节点查看配置</p>
