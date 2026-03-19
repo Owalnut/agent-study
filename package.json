@@ -1,0 +1,16 @@
+{
+  "name": "walnut-agent",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/web",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"mvn -f apps/server/pom.xml spring-boot:run\" \"npm run dev -w @walnut/web\"",
+    "build": "mvn -f apps/server/pom.xml -DskipTests compile && npm run build -w @walnut/workflow-engine && npm run build -w @walnut/web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
