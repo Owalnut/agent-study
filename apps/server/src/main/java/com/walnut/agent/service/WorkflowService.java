@@ -19,6 +19,7 @@ import java.nio.ByteOrder;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.Consumer;
 
 @Service
 public class WorkflowService {
@@ -81,33 +82,44 @@ public class WorkflowService {
     }
 
     public WorkflowDtos.DebugWorkflowResponse debugWorkflow(WorkflowDtos.DebugWorkflowRequest req) {
+        return debugWorkflowWithEvents(req, null);
+    }
+
+    public WorkflowDtos.DebugWorkflowResponse debugWorkflowWithEvents(
+            WorkflowDtos.DebugWorkflowRequest req,
+            Consumer<DebugEvent> eventConsumer
+    ) {
         WorkflowExecutionEntity execution = new WorkflowExecutionEntity();
         execution.setWorkflowId(req.workflowId() == null ? 0L : req.workflowId());
         execution.setInputText(req.input());
         execution.setStatus("RUNNING");
         executionMapper.insert(execution);
+        emit(eventConsumer, "RUNNING", execution.getId(), Map.of("message", "workflow started"));
 
         try {
             Map<String, Object> workflowMap = req.workflow() != null ? req.workflow() : getDefaultWorkflow();
             WorkflowDtos.WorkflowGraph graph = objectMapper.convertValue(workflowMap, WorkflowDtos.WorkflowGraph.class);
-            WorkflowDtos.DebugOutput output = executeGraph(graph, req.input());
+            WorkflowDtos.DebugOutput output = executeGraph(graph, req.input(), execution.getId(), eventConsumer);
             execution.setStatus("SUCCESS");
             execution.setOutputText(output.text());
             execution.setAudioBase64(output.audioBase64());
             execution.setUpdatedAt(LocalDateTime.now());
             executionMapper.updateById(execution);
+            emit(eventConsumer, "SUCCESS", execution.getId(), Map.of("output", output));
             return new WorkflowDtos.DebugWorkflowResponse(true, execution.getId(), "SUCCESS", null, output, null);
         } catch (WorkflowNodeException e) {
             execution.setStatus(e.status());
             execution.setErrorMessage(e.getMessage());
             execution.setUpdatedAt(LocalDateTime.now());
             executionMapper.updateById(execution);
+            emit(eventConsumer, "NODE_ERROR", execution.getId(), Map.of("errorCode", e.code(), "message", e.getMessage()));
             return new WorkflowDtos.DebugWorkflowResponse(false, execution.getId(), e.status(), e.code(), null, e.getMessage());
         } catch (Exception e) {
             execution.setStatus("FAILED");
             execution.setErrorMessage(e.getMessage());
             execution.setUpdatedAt(LocalDateTime.now());
             executionMapper.updateById(execution);
+            emit(eventConsumer, "FAILED", execution.getId(), Map.of("errorCode", "INTERNAL_ERROR", "message", e.getMessage()));
             return new WorkflowDtos.DebugWorkflowResponse(false, execution.getId(), "FAILED", "INTERNAL_ERROR", null, e.getMessage());
         }
     }
@@ -128,13 +140,20 @@ public class WorkflowService {
         );
     }
 
-    private WorkflowDtos.DebugOutput executeGraph(WorkflowDtos.WorkflowGraph graph, String input) throws Exception {
+    private WorkflowDtos.DebugOutput executeGraph(
+            WorkflowDtos.WorkflowGraph graph,
+            String input,
+            Long executionId,
+            Consumer<DebugEvent> eventConsumer
+    ) throws Exception {
         List<WorkflowDtos.Node> sorted = topologicalSort(graph.nodes(), graph.edges());
         Map<String, Map<String, String>> values = new HashMap<>();
         Map<String, String> output = Map.of("text", input);
         for (WorkflowDtos.Node node : sorted) {
+            emit(eventConsumer, "NODE_START", executionId, Map.of("nodeId", node.id(), "nodeType", node.type()));
             if ("input".equals(node.type())) {
                 values.put(node.id(), Map.of("text", input));
+                emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "text", input));
                 continue;
             }
             Map<String, String> prev = findIncomingValue(node.id(), graph.edges(), values);
@@ -142,16 +161,24 @@ public class WorkflowService {
                 String prompt = prev.getOrDefault("text", input);
                 String llmText = executeWithRetry(() -> runWithTimeout(() -> "【LLM模拟】" + prompt));
                 values.put(node.id(), Map.of("text", llmText));
+                emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "text", llmText));
             } else if ("tool_tts".equals(node.type())) {
                 String text = prev.getOrDefault("text", "");
                 byte[] wav = executeWithRetry(() -> runWithTimeout(() -> generateSimpleWav()));
                 values.put(node.id(), Map.of("text", text, "audioBase64", Base64.getEncoder().encodeToString(wav), "contentType", "audio/wav"));
+                emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "audioReady", true));
             } else if ("output".equals(node.type())) {
                 output = prev;
                 values.put(node.id(), output);
+                emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "text", output.get("text")));
             }
         }
         return new WorkflowDtos.DebugOutput(output.get("text"), output.get("audioBase64"), output.getOrDefault("contentType", "audio/wav"));
+    }
+
+    private void emit(Consumer<DebugEvent> consumer, String type, Long executionId, Object payload) {
+        if (consumer == null) return;
+        consumer.accept(new DebugEvent(type, executionId, payload));
     }
 
     private <T> T executeWithRetry(Callable<T> callable) throws Exception {
@@ -296,4 +323,6 @@ public class WorkflowService {
             return status;
         }
     }
+
+    public record DebugEvent(String type, Long executionId, Object payload) {}
 }
