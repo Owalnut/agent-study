@@ -1,5 +1,16 @@
 import { DragEvent, useEffect, useMemo, useRef, useState } from "react";
-import ReactFlow, { Background, Controls, Edge, Node, ReactFlowInstance } from "reactflow";
+import ReactFlow, {
+  Background,
+  Controls,
+  applyNodeChanges,
+  Edge,
+  Handle,
+  MarkerType,
+  Node,
+  NodeProps,
+  Position,
+  ReactFlowInstance
+} from "reactflow";
 import "reactflow/dist/style.css";
 
 const API_BASE = "http://localhost:8787";
@@ -14,13 +25,58 @@ type WsEvent = { type: string; executionId?: number; payload?: Record<string, un
 type OutputParamType = "input" | "reference";
 type OutputParam = { id: string; name: string; type: OutputParamType; value: string };
 
-type FlowNode = Node<{ label: string }, "default"> & { meta: WorkflowNodeMeta };
+type NodeResult = {
+  nodeId: string;
+  nodeType: NodeType;
+  status: string;
+  durationMs: number | null;
+  text: string | null;
+  errorCode: string | null;
+};
+type WorkflowExecutionResponse = {
+  id: number;
+  workflowId: number;
+  inputText: string;
+  status: string;
+  outputText: string | null;
+  audioBase64: string | null;
+  errorMessage: string | null;
+  nodeResults: NodeResult[];
+};
+type WorkflowDefinitionResponse = {
+  id: number;
+  name: string;
+  workflow: Workflow;
+  draft: boolean;
+  published: boolean;
+};
+
+type FlowNode = Node<{ label: string; nodeType: NodeType }, "workflowNode"> & { meta: WorkflowNodeMeta };
+
+function WorkflowNodeView({ data, isConnectable }: NodeProps<{ label: string; nodeType: NodeType }>) {
+  const supportsSource = data.nodeType === "input" || data.nodeType === "llm" || data.nodeType === "tool_tts";
+  const supportsTarget = data.nodeType === "llm" || data.nodeType === "tool_tts" || data.nodeType === "output";
+
+  return (
+    <div className="workflow-node" style={{ pointerEvents: "all" }}>
+      <div className="workflow-node-label">{data.label}</div>
+      {supportsTarget && <Handle type="target" position={Position.Left} id="in" isConnectable={isConnectable} />}
+      {supportsSource && <Handle type="source" position={Position.Right} id="out" isConnectable={isConnectable} />}
+    </div>
+  );
+}
+
+const NODE_TYPES = { workflowNode: WorkflowNodeView } as const;
 
 const llmNodes: Array<{ type: NodeType; label: string; icon: string }> = [
   { type: "llm", label: "DeepSeek", icon: "🧠" },
   { type: "llm", label: "通义千问", icon: "✨" },
   { type: "llm", label: "AI Ping", icon: "🚀" },
   { type: "llm", label: "智谱", icon: "🧝" }
+];
+const baseNodes: Array<{ type: NodeType; label: string; icon: string }> = [
+  { type: "input", label: "输入", icon: "⌨️" },
+  { type: "output", label: "输出", icon: "🔚" }
 ];
 const toolNodes: Array<{ type: NodeType; label: string; icon: string }> = [
   { type: "tool_tts", label: "超拟人音频合成", icon: "🎙️" }
@@ -42,9 +98,18 @@ export default function App() {
   const [debugInput, setDebugInput] = useState("你好，帮我生成一期关于 AI Agent 的播客开场白。");
   const [debugResult, setDebugResult] = useState<DebugOutput | null>(null);
   const [loading, setLoading] = useState(false);
+  const [currentWorkflowId, setCurrentWorkflowId] = useState<number | null>(null);
+  const [latestExecution, setLatestExecution] = useState<WorkflowExecutionResponse | null>(null);
+  const [liveNodeResults, setLiveNodeResults] = useState<NodeResult[]>([]);
+  const [executionStatus, setExecutionStatus] = useState<string>("");
+  const [executionError, setExecutionError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [outputConfigs, setOutputConfigs] = useState<Record<string, OutputParam[]>>({});
   const [outputTemplates, setOutputTemplates] = useState<Record<string, string>>({});
+  const [loadModalOpen, setLoadModalOpen] = useState(false);
+  const [workflowsList, setWorkflowsList] = useState<WorkflowDefinitionResponse[]>([]);
+  const [workflowsLoading, setWorkflowsLoading] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const flowRef = useRef<ReactFlowInstance | null>(null);
 
@@ -63,28 +128,168 @@ export default function App() {
     const nextToken = loginData.token;
     setToken(nextToken);
 
+    const savedWorkflowIdRaw = localStorage.getItem("walnutAgent.currentWorkflowId");
+    const savedWorkflowId = savedWorkflowIdRaw ? Number(savedWorkflowIdRaw) : null;
+
+    if (savedWorkflowId) {
+      try {
+        await handleLoadWorkflow(savedWorkflowId, nextToken);
+        return;
+      } catch {
+        // fallback to default
+      }
+    }
+
     const workflowResp = await fetch(`${API_BASE}/api/workflows/default`, {
       headers: { Authorization: `Bearer ${nextToken}` }
     });
-    const workflow = (await workflowResp.json()) as Workflow;
+    const raw = (await workflowResp.json()) as Workflow & { workflowId?: number | null; name?: string };
+    const workflow = raw;
     const flowNodes = workflow.nodes.map((node, index) => ({
       id: node.id,
-      type: "default" as const,
+      type: "workflowNode" as const,
       position: { x: 280, y: 60 + index * 125 },
-      data: { label: node.data?.name || nodeTypeLabel[node.type] || node.type },
+      data: { label: node.data?.name || nodeTypeLabel[node.type] || node.type, nodeType: node.type },
+      draggable: true,
       meta: node
     }));
     const flowEdges = workflow.edges.map((edge) => ({
       ...edge,
-      animated: true
+      animated: true,
+      markerEnd: { type: MarkerType.ArrowClosed, color: "#6b7280" }
     }));
     setNodes(flowNodes);
     setEdges(flowEdges);
+    setCurrentWorkflowId(raw.workflowId ?? null);
+    if (raw.workflowId) {
+      localStorage.setItem("walnutAgent.currentWorkflowId", String(raw.workflowId));
+    }
+    if (raw.workflowId) {
+      await loadLatestExecution(raw.workflowId, nextToken);
+    } else {
+      setLatestExecution(null);
+      setLiveNodeResults([]);
+      setExecutionStatus("");
+      setExecutionError(null);
+      setDebugResult(null);
+    }
+  }
+
+  function handleNewWorkflow() {
+    setNodes([]);
+    setEdges([]);
+    setSelectedNode(null);
+    setOutputConfigs({});
+    setOutputTemplates({});
+    setCurrentWorkflowId(null);
+    localStorage.removeItem("walnutAgent.currentWorkflowId");
+    setLatestExecution(null);
+    setLiveNodeResults([]);
+    setExecutionStatus("");
+    setExecutionError(null);
+    setDebugResult(null);
+  }
+
+  async function loadLatestExecution(workflowId: number, authToken: string = token): Promise<void> {
+    try {
+      const resp = await fetch(`${API_BASE}/api/workflows/${workflowId}/latest-execution`, {
+        headers: { Authorization: `Bearer ${authToken}` }
+      });
+      if (!resp.ok) {
+        setLatestExecution(null);
+        setLiveNodeResults([]);
+        setExecutionStatus("");
+        setExecutionError(null);
+        return;
+      }
+      const latest = (await resp.json()) as WorkflowExecutionResponse;
+      setLatestExecution(latest);
+      setExecutionStatus(latest.status);
+      setExecutionError(latest.errorMessage);
+      setLiveNodeResults(latest.nodeResults ?? []);
+      if (latest.outputText || latest.audioBase64) {
+        setDebugResult({
+          text: latest.outputText ?? "",
+          audioBase64: latest.audioBase64 ?? null,
+          contentType: "audio/wav"
+        });
+      } else {
+        setDebugResult(null);
+      }
+    } catch (e) {
+      setLatestExecution(null);
+      setLiveNodeResults([]);
+      setExecutionStatus("");
+      setExecutionError(null);
+    }
+  }
+
+  async function loadWorkflowsList(authToken: string = token): Promise<void> {
+    if (!authToken) return;
+    setWorkflowsLoading(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/workflows`, {
+        headers: { Authorization: `Bearer ${authToken}` }
+      });
+      if (!resp.ok) throw new Error(`list workflows failed: ${resp.status}`);
+      const list = (await resp.json()) as WorkflowDefinitionResponse[];
+      setWorkflowsList(list);
+    } catch (e) {
+      setWorkflowsList([]);
+    } finally {
+      setWorkflowsLoading(false);
+    }
+  }
+
+  async function handleLoadWorkflow(workflowId: number, authToken: string = token): Promise<void> {
+    try {
+      const resp = await fetch(`${API_BASE}/api/workflows/${workflowId}`, {
+        headers: { Authorization: `Bearer ${authToken}` }
+      });
+      if (!resp.ok) throw new Error(`load workflow failed: ${resp.status}`);
+      const def = (await resp.json()) as WorkflowDefinitionResponse;
+      const workflow = def.workflow;
+      const flowNodes = workflow.nodes.map((node, index) => ({
+        id: node.id,
+        type: "workflowNode" as const,
+        position: { x: 280, y: 60 + index * 125 },
+        data: { label: node.data?.name || nodeTypeLabel[node.type] || node.type, nodeType: node.type },
+        draggable: true,
+        meta: node
+      }));
+      const flowEdges = workflow.edges.map((edge) => ({
+        ...edge,
+        animated: true,
+        markerEnd: { type: MarkerType.ArrowClosed, color: "#6b7280" }
+      }));
+      setNodes(flowNodes);
+      setEdges(flowEdges);
+      setSelectedNode(null);
+      setOutputConfigs({});
+      setOutputTemplates({});
+      setCurrentWorkflowId(workflowId);
+      localStorage.setItem("walnutAgent.currentWorkflowId", String(workflowId));
+      setLoadModalOpen(false);
+      await loadLatestExecution(workflowId, authToken);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e));
+    }
   }
 
   const workflowPayload = useMemo(
     () => ({
-      nodes: nodes.map((node) => node.meta),
+      nodes: nodes.map((node) => {
+        const meta = (node as unknown as { meta?: WorkflowNodeMeta }).meta;
+        if (meta) return meta;
+        // 兜底：如果自定义字段 meta 在某些更新流程中丢失，用 data 反推
+        return {
+          id: node.id,
+          type: (node.data as unknown as { nodeType?: NodeType }).nodeType ?? "input",
+          data: {
+            name: (node.data as unknown as { label?: string }).label ?? node.id
+          }
+        } satisfies WorkflowNodeMeta;
+      }),
       edges: edges.map(({ id, source, target }) => ({ id, source, target }))
     }),
     [nodes, edges]
@@ -96,7 +301,11 @@ export default function App() {
 
   const referenceOptions = useMemo(() => {
     return nodes
-      .filter((n) => n.meta.type !== "output")
+      .filter((n) => {
+        const metaType = (n as unknown as { meta?: WorkflowNodeMeta }).meta?.type;
+        const dataType = (n.data as unknown as { nodeType?: NodeType }).nodeType;
+        return (metaType ?? dataType) !== "output";
+      })
       .flatMap((n) => [
         { label: `${n.data.label}.text`, value: `${n.id}.text` },
         { label: `${n.data.label}.audioBase64`, value: `${n.id}.audioBase64` }
@@ -108,6 +317,10 @@ export default function App() {
     setLoading(true);
     setLogs([]);
     setDebugResult(null);
+    setLatestExecution(null);
+    setLiveNodeResults([]);
+    setExecutionStatus("RUNNING");
+    setExecutionError(null);
     wsRef.current?.close();
 
     const ws = new WebSocket(`${WS_BASE}?token=${encodeURIComponent(token)}`);
@@ -116,24 +329,61 @@ export default function App() {
       ws.send(
         JSON.stringify({
           type: "START_DEBUG",
-          payload: { input: debugInput, workflow: workflowPayload }
+          payload: { input: debugInput, workflow: workflowPayload, workflowId: currentWorkflowId }
         })
       );
     };
     ws.onmessage = async (event) => {
       const message = JSON.parse(event.data) as WsEvent;
-      setLogs((prev) => [...prev, `[${message.type}] ${JSON.stringify(message.payload ?? {})}`]);
+      const payload = message.payload ?? {};
+      setLogs((prev) => [...prev, `[${message.type}] ${JSON.stringify(payload)}`]);
+
+      if (message.type === "RUNNING") {
+        setExecutionStatus("RUNNING");
+        setExecutionError(null);
+        setLiveNodeResults([]);
+      } else if (message.type === "NODE_START") {
+        const nodeId = (payload as any).nodeId as string;
+        const nodeType = (payload as any).nodeType as NodeType;
+        setLiveNodeResults((prev) => {
+          if (prev.find((p) => p.nodeId === nodeId)) return prev;
+          return [...prev, { nodeId, nodeType, status: "RUNNING", durationMs: null, text: null, errorCode: null }];
+        });
+      } else if (message.type === "NODE_SUCCESS") {
+        const nodeId = (payload as any).nodeId as string;
+        const text = (payload as any).text as string | undefined;
+        setLiveNodeResults((prev) =>
+          prev.map((n) => (n.nodeId === nodeId ? { ...n, status: "SUCCESS", text: text ?? n.text } : n))
+        );
+      } else if (message.type === "NODE_ERROR") {
+        const nodeId = (payload as any).nodeId as string;
+        const nodeType = (payload as any).nodeType as NodeType;
+        const errorCode = (payload as any).errorCode as string | null;
+        setLiveNodeResults((prev) =>
+          prev.map((n) =>
+            n.nodeId === nodeId ? { ...n, nodeType: nodeType ?? n.nodeType, status: "FAILED", errorCode: errorCode ?? n.errorCode } : n
+          )
+        );
+      }
       if (message.type === "COMPLETED") {
-        const payload = message.payload ?? {};
-        const output = payload.output as DebugOutput | undefined;
+        const output = (payload as any).output as DebugOutput | undefined;
         setDebugResult(output ?? null);
         if (output?.audioBase64) {
           const audio = new Audio(`data:${output.contentType};base64,${output.audioBase64}`);
           await audio.play();
         }
+        if (message.executionId) {
+          await loadExecutionById(message.executionId, token);
+        }
+        setExecutionStatus((payload as any).executionStatus ?? "SUCCESS");
         setLoading(false);
         ws.close();
       } else if (message.type === "FAILED") {
+        if (message.executionId) {
+          await loadExecutionById(message.executionId, token);
+        }
+        setExecutionStatus((payload as any).executionStatus ?? "FAILED");
+        setExecutionError((payload as any).error ?? (payload as any).errorCode ?? "执行失败");
         setLoading(false);
         ws.close();
       }
@@ -145,6 +395,75 @@ export default function App() {
     ws.onclose = () => {
       setLoading(false);
     };
+  }
+
+  async function loadExecutionById(executionId: number, authToken: string): Promise<void> {
+    const resp = await fetch(`${API_BASE}/api/workflows/executions/${executionId}`, {
+      headers: { Authorization: `Bearer ${authToken}` }
+    });
+    if (!resp.ok) return;
+    const exec = (await resp.json()) as WorkflowExecutionResponse;
+    setLatestExecution(exec);
+    setExecutionStatus(exec.status);
+    setExecutionError(exec.errorMessage);
+    setLiveNodeResults(exec.nodeResults ?? []);
+    if (exec.outputText || exec.audioBase64) {
+      setDebugResult({
+        text: exec.outputText ?? "",
+        audioBase64: exec.audioBase64 ?? null,
+        contentType: "audio/wav"
+      });
+    } else {
+      setDebugResult(null);
+    }
+  }
+
+  async function handleSaveWorkflow(): Promise<void> {
+    if (!token) {
+      alert("请先登录/加载工作流");
+      return;
+    }
+    const name = window.prompt("请输入工作流名称", `workflow-${Date.now()}`);
+    if (!name) return;
+    setSaving(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/workflows`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          name,
+          workflow: workflowPayload,
+          draft: true,
+          published: false
+        })
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(text || `save failed: ${resp.status}`);
+      }
+      const saved = (await resp.json()) as { id?: number };
+      const savedId = saved.id ?? null;
+      setLogs((prev) => [...prev, `[SAVE] ok id=${savedId ?? "-"}`]);
+      if (savedId) {
+        setCurrentWorkflowId(savedId);
+        localStorage.setItem("walnutAgent.currentWorkflowId", String(savedId));
+        setLatestExecution(null);
+        setLiveNodeResults([]);
+        setExecutionStatus("");
+        setExecutionError(null);
+        setDebugResult(null);
+      }
+      setDebugOpen(true);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setLogs((prev) => [...prev, `[SAVE] failed: ${msg}`]);
+      alert(`保存失败：${msg}`);
+    } finally {
+      setSaving(false);
+    }
   }
 
   function appendNodeAt(template: { type: NodeType; label: string }, x: number, y: number) {
@@ -160,9 +479,10 @@ export default function App() {
       ...prev,
       {
         id,
-        type: "default",
+        type: "workflowNode",
         position: { x, y },
-        data: { label: template.label },
+        data: { label: template.label, nodeType: template.type },
+        draggable: true,
         meta
       }
     ]);
@@ -192,6 +512,24 @@ export default function App() {
     }));
   }
 
+  function deleteNode(nodeId: string) {
+    // 同时移除节点本身、与之相连的边，以及该节点的输出配置状态
+    if (!confirm("确定删除该节点吗？同时会删除所有连接的边。")) return;
+    setNodes((prev) => prev.filter((n) => n.id !== nodeId));
+    setEdges((prev) => prev.filter((e) => e.source !== nodeId && e.target !== nodeId));
+    setOutputConfigs((prev) => {
+      const next = { ...prev };
+      delete next[nodeId];
+      return next;
+    });
+    setOutputTemplates((prev) => {
+      const next = { ...prev };
+      delete next[nodeId];
+      return next;
+    });
+    setSelectedNode(null);
+  }
+
   function insertTemplateVar(nodeId: string, name: string) {
     if (!name) return;
     setOutputTemplates((prev) => ({ ...prev, [nodeId]: `${prev[nodeId] ?? ""}{{${name}}}` }));
@@ -203,14 +541,18 @@ export default function App() {
   }
 
   function handleDragOver(event: DragEvent<HTMLDivElement>) {
+    // 仅当是“节点库 -> 画布”的自定义拖拽数据时，才阻止默认行为；
+    // 否则会与 ReactFlow 内部的节点拖拽产生冲突，导致节点无法移动。
+    const types = Array.from(event.dataTransfer.types);
+    if (!types.includes("application/walnut-node")) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
   }
 
   function handleDrop(event: DragEvent<HTMLDivElement>) {
-    event.preventDefault();
     const raw = event.dataTransfer.getData("application/walnut-node");
     if (!raw || !flowRef.current) return;
+    event.preventDefault();
     const template = JSON.parse(raw) as { type: NodeType; label: string };
     const bounds = event.currentTarget.getBoundingClientRect();
     const position = flowRef.current.project({
@@ -228,10 +570,31 @@ export default function App() {
           <span className="workspace">qoder5</span>
         </div>
         <div className="top-actions">
-          <button className="btn ghost">＋ 新建</button>
-          <button className="btn ghost">📂 加载</button>
-          <button className="btn primary">💾 保存</button>
-          <button className="btn primary">🧪 调试</button>
+            <button className="btn ghost" onClick={handleNewWorkflow}>
+              ＋ 新建
+            </button>
+            <button
+              className="btn ghost"
+              onClick={() => {
+                setLoadModalOpen(true);
+                void loadWorkflowsList();
+              }}
+            >
+              📂 加载
+            </button>
+            <button className="btn primary" onClick={() => void handleSaveWorkflow()} disabled={saving}>
+              {saving ? "保存中..." : "💾 保存"}
+            </button>
+            <button
+              className="btn primary"
+              onClick={() => {
+                setDebugOpen(true);
+                void handleDebug();
+              }}
+              disabled={loading}
+            >
+              🧪 调试
+            </button>
           <span className="user">admin</span>
         </div>
       </header>
@@ -239,6 +602,12 @@ export default function App() {
       <div className="layout">
         <aside className="panel left">
           <h3>节点库</h3>
+          {baseNodes.map((n) => (
+            <button key={n.type} className="node-btn" draggable onDragStart={(e) => handleDragStart(e, n)}>
+              <span className="node-icon">{n.icon}</span>
+              <span>{n.label}</span>
+            </button>
+          ))}
           <p className="group-title">📁 大模型节点</p>
           {llmNodes.map((n) => (
             <button key={n.label} className="node-btn" draggable onDragStart={(e) => handleDragStart(e, n)}>
@@ -258,14 +627,65 @@ export default function App() {
 
         <main className="canvas-wrap" onDragOver={handleDragOver} onDrop={handleDrop}>
           <ReactFlow
+            nodeTypes={NODE_TYPES}
             nodes={nodes}
             edges={edges}
             fitView
+            nodesDraggable={true}
+            nodesConnectable={true}
+            connectOnClick={false}
+            defaultEdgeOptions={{
+              markerEnd: { type: MarkerType.ArrowClosed, color: "#6b7280" }
+            }}
+            onConnect={(params) => {
+              const { source, target } = params;
+              if (!source || !target) return;
+              const edgeId = `e-${source}-${target}-${Date.now()}`;
+              setEdges((prev) => [
+                ...prev,
+                {
+                  id: edgeId,
+                  source,
+                  target,
+                  animated: true,
+                  markerEnd: { type: MarkerType.ArrowClosed, color: "#6b7280" }
+                }
+              ]);
+            }}
             onInit={(instance) => {
               flowRef.current = instance;
             }}
-            onNodeClick={(_, node) => setSelectedNode((node as FlowNode).meta)}
-            onPaneClick={() => setSelectedNode(null)}
+            onNodesChange={(changes) => {
+              // ReactFlow 拖拽节点会产生位置变更；这里将其回写到受控状态，避免拖拽后回弹。
+              setNodes((prev) => {
+                const next = applyNodeChanges(changes, prev);
+                // applyNodeChanges 只保证 ReactFlow 标准字段更新，
+                // 我们的节点自定义字段 `meta` 需要在更新后继续保留。
+                const metaById = new Map(prev.map((n) => [n.id, n.meta]));
+                return next.map((n) => ({ ...n, meta: metaById.get(n.id) }));
+              });
+            }}
+            onNodeClick={(event, node) => {
+              event.stopPropagation();
+              const anyNode = node as unknown as { meta?: WorkflowNodeMeta; data: any };
+              if (anyNode.meta) {
+                setSelectedNode(anyNode.meta);
+                return;
+              }
+              const nodeType = (anyNode.data?.nodeType ?? "input") as NodeType;
+              setSelectedNode({
+                id: node.id,
+                type: nodeType,
+                data: { name: anyNode.data?.label }
+              });
+            }}
+            onPaneClick={(event) => {
+              const target = event?.target as unknown;
+              if (target instanceof HTMLElement && target.closest(".workflow-node")) {
+                return;
+              }
+              setSelectedNode(null);
+            }}
           >
             <Background gap={22} size={1} />
             <Controls />
@@ -280,6 +700,9 @@ export default function App() {
               <div className="config-input">{selectedNode.id}</div>
               <label className="config-label">节点类型</label>
               <div className="config-input">{selectedNode.type}</div>
+              <button className="remove-btn" onClick={() => deleteNode(selectedNode.id)}>
+                删除此节点
+              </button>
               {selectedNode.type === "input" ? (
                 <>
                   <label className="config-label">变量名</label>
@@ -345,7 +768,7 @@ export default function App() {
                             </select>
                           )}
                           <button className="remove-btn" onClick={() => removeOutputParam(selectedNode.id, item.id)}>
-                            删除
+                            移除
                           </button>
                         </div>
                       ))
@@ -386,6 +809,41 @@ export default function App() {
         </aside>
       </div>
 
+      {loadModalOpen && (
+        <div className="modal-overlay" onClick={() => setLoadModalOpen(false)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <strong>加载工作流</strong>
+              <button className="modal-close" onClick={() => setLoadModalOpen(false)}>
+                ×
+              </button>
+            </div>
+            <div className="modal-body">
+              {workflowsLoading ? (
+                <div className="hint">加载中...</div>
+              ) : workflowsList.length === 0 ? (
+                <div className="hint">暂无工作流</div>
+              ) : (
+                workflowsList.map((w) => (
+                  <div key={w.id} className="workflow-row">
+                    <div className="workflow-row-left">
+                      <div className="workflow-name">{w.name}</div>
+                      <div className="workflow-sub">
+                        {w.draft ? "草稿" : ""}
+                        {w.published ? (w.draft ? " / 发布" : "发布") : ""}
+                      </div>
+                    </div>
+                    <button className="workflow-load-btn" onClick={() => void handleLoadWorkflow(w.id)}>
+                      加载
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       <section className={`debug-drawer ${debugOpen ? "open" : ""}`}>
         <div className="debug-header">
           <strong>调试抽屉</strong>
@@ -404,11 +862,45 @@ export default function App() {
               {loading ? "调试中..." : "开始调试"}
             </button>
             <div className="result-box">
-              <div>执行日志(实时):</div>
-              <pre>{logs.length ? logs.join("\n") : "-"}</pre>
-              <div>LLM 文本输出:</div>
-              <pre>{debugResult?.text || "-"}</pre>
-              <div>音频状态: {debugResult?.audioBase64 ? "已返回音频并自动播放" : "未返回音频"}</div>
+              <div className="exec-head">
+                <div>执行状态: {executionStatus || "-"}</div>
+                {executionError ? <div className="exec-error">错误: {executionError}</div> : null}
+              </div>
+
+              <div className="exec-nodes-head">
+                节点执行状态（{liveNodeResults.length}）
+              </div>
+              <div className="exec-nodes">
+                {liveNodeResults.length ? (
+                  liveNodeResults.map((n) => (
+                    <div key={n.nodeId} className="exec-node-row">
+                      <span className={`exec-node-dot ${n.status === "SUCCESS" ? "ok" : n.status === "FAILED" ? "bad" : ""}`}>
+                        {n.status === "SUCCESS" ? "✓" : n.status === "FAILED" ? "×" : n.status === "RUNNING" ? "..." : "?"}
+                      </span>
+                      <span className="exec-node-type">{n.nodeType}</span>
+                      <span className="exec-node-status">{n.status}</span>
+                      {n.durationMs != null ? <span className="exec-node-dur">{n.durationMs}ms</span> : null}
+                    </div>
+                  ))
+                ) : (
+                  <div className="hint">暂无节点结果</div>
+                )}
+              </div>
+
+              <div className="exec-io">
+                <div className="exec-io-row">
+                  <div>输入数据:</div>
+                  <pre className="io-pre">{latestExecution?.inputText || "-"}</pre>
+                </div>
+                <div className="exec-io-row">
+                  <div>输出数据:</div>
+                  <pre className="io-pre">{debugResult?.text || latestExecution?.outputText || "-"}</pre>
+                </div>
+              </div>
+
+              <div className="exec-audio">
+                音频状态: {debugResult?.audioBase64 ? "已返回音频并自动播放" : "未返回音频"}
+              </div>
             </div>
           </div>
         )}

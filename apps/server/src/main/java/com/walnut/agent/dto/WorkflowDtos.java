@@ -53,6 +53,16 @@ public class WorkflowDtos {
             String status,
             String outputText,
             String audioBase64,
-            String errorMessage
+            String errorMessage,
+            List<NodeResult> nodeResults
+    ) {}
+
+    public record NodeResult(
+            String nodeId,
+            String nodeType,
+            String status,
+            Long durationMs,
+            String text,
+            String errorCode
     ) {}
 }

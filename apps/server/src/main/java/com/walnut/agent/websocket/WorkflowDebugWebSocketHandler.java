@@ -53,12 +53,13 @@ public class WorkflowDebugWebSocketHandler extends TextWebSocketHandler {
 
         JsonNode payload = root.path("payload");
         String input = payload.path("input").asText("");
+        Long workflowId = payload.hasNonNull("workflowId") ? payload.get("workflowId").asLong() : null;
         JsonNode workflowNode = payload.get("workflow");
         Map<String, Object> workflow = workflowNode == null || workflowNode.isNull()
                 ? null
                 : objectMapper.convertValue(workflowNode, Map.class);
 
-        WorkflowDtos.DebugWorkflowRequest req = new WorkflowDtos.DebugWorkflowRequest(null, workflow, input);
+        WorkflowDtos.DebugWorkflowRequest req = new WorkflowDtos.DebugWorkflowRequest(workflowId, workflow, input);
         WorkflowDtos.DebugWorkflowResponse resp = workflowService.debugWorkflowWithEvents(
                 req,
                 event -> send(session, event.type(), event.executionId(), event.payload())

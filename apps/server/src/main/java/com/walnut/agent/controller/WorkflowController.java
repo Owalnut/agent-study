@@ -21,6 +21,26 @@ public class WorkflowController {
         return workflowService.getDefaultWorkflow();
     }
 
+    @GetMapping
+    public java.util.List<WorkflowDtos.WorkflowDefinitionResponse> listWorkflows() {
+        return workflowService.listWorkflows();
+    }
+
+    @GetMapping("/{workflowId}")
+    public WorkflowDtos.WorkflowDefinitionResponse getWorkflow(@PathVariable Long workflowId) {
+        return workflowService.getWorkflow(workflowId);
+    }
+
+    @DeleteMapping("/{workflowId}")
+    public void deleteWorkflow(@PathVariable Long workflowId) {
+        workflowService.deleteWorkflow(workflowId);
+    }
+
+    @GetMapping("/{workflowId}/latest-execution")
+    public WorkflowDtos.WorkflowExecutionResponse getLatestExecution(@PathVariable Long workflowId) {
+        return workflowService.getLatestExecution(workflowId);
+    }
+
     @PostMapping
     public WorkflowDtos.WorkflowDefinitionResponse saveWorkflow(@Valid @RequestBody WorkflowDtos.SaveWorkflowRequest req) {
         return workflowService.saveWorkflow(req);

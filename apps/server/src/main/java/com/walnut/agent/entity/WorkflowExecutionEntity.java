@@ -14,6 +14,7 @@ public class WorkflowExecutionEntity {
     private String status;
     private String outputText;
     private String audioBase64;
+    private String nodeResults;
     private String errorMessage;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;

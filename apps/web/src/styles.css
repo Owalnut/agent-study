@@ -138,6 +138,29 @@ body,
   font-size: 13px;
 }
 
+.workflow-node {
+  background: #fff;
+  border: 1px solid #3d465c;
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 13px;
+  color: #1f2937;
+  pointer-events: all;
+  user-select: none;
+  cursor: grab;
+}
+
+.workflow-node-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+
+.react-flow__handle {
+  background: #2f6dff !important;
+}
+
 .config-stack {
   display: grid;
   gap: 8px;
@@ -252,6 +275,183 @@ body,
   border: 1px solid #e6e9f3;
   border-radius: 12px;
   padding: 10px 12px;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.35);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 50;
+}
+
+.modal-card {
+  width: 720px;
+  max-width: calc(100vw - 24px);
+  background: #fff;
+  border-radius: 12px;
+  border: 1px solid #e6e9f3;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+  overflow: hidden;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 14px;
+  border-bottom: 1px solid #eef1f6;
+}
+
+.modal-close {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 22px;
+  line-height: 1;
+  color: #6b7280;
+}
+
+.modal-body {
+  padding: 12px 14px;
+  max-height: 60vh;
+  overflow: auto;
+}
+
+.result-box .exec-head {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.exec-error {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+.exec-nodes-head {
+  color: #374151;
+  font-weight: 600;
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.exec-nodes {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.exec-node-row {
+  display: grid;
+  grid-template-columns: 26px 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid #eef1f6;
+  border-radius: 10px;
+  background: #fafafa;
+}
+
+.exec-node-dot {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-size: 12px;
+}
+
+.exec-node-dot.ok {
+  background: #16a34a;
+  color: #fff;
+}
+
+.exec-node-dot.bad {
+  background: #dc2626;
+  color: #fff;
+}
+
+.exec-node-dot:not(.ok):not(.bad) {
+  background: #e5e7eb;
+  color: #111827;
+}
+
+.exec-node-type {
+  color: #111827;
+  font-weight: 600;
+}
+
+.exec-node-status {
+  color: #6b7280;
+  font-weight: 600;
+}
+
+.exec-node-dur {
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.exec-io {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.exec-io-row {
+  display: grid;
+  gap: 6px;
+}
+
+.io-pre {
+  margin: 0;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid #eef1f6;
+  background: #fff;
+  max-height: 120px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.exec-audio {
+  color: #374151;
+  font-weight: 600;
+}
+
+.workflow-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid #f1f3f7;
+}
+
+.workflow-row-left {
+  display: grid;
+  gap: 4px;
+}
+
+.workflow-name {
+  font-weight: 600;
+  color: #111827;
+}
+
+.workflow-sub {
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.workflow-load-btn {
+  border: 1px solid #d8dff1;
+  border-radius: 8px;
+  background: #fff;
+  padding: 8px 12px;
+  cursor: pointer;
 }
 
 .debug-header {

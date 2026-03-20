@@ -60,15 +60,26 @@ public class WorkflowService {
     }
 
     public Map<String, Object> getDefaultWorkflow() {
-        return Map.of(
-                "nodes", List.of(
-                        Map.of("id", "input-default", "type", "input", "data", Map.of("name", "输入")),
-                        Map.of("id", "output-default", "type", "output", "data", Map.of("name", "输出"))
-                ),
-                "edges", List.of(
-                        Map.of("id", "e1", "source", "input-default", "target", "output-default")
-                )
+        WorkflowDefinitionEntity entity = definitionMapper.selectOne(
+                new LambdaQueryWrapper<WorkflowDefinitionEntity>().eq(WorkflowDefinitionEntity::getIsPublished, 1).last("limit 1")
         );
+        if (entity == null) {
+            return Map.of(
+                    "workflowId", null,
+                    "name", "default",
+                    "nodes", List.of(
+                            Map.of("id", "input-default", "type", "input", "data", Map.of("name", "输入")),
+                            Map.of("id", "output-default", "type", "output", "data", Map.of("name", "输出"))
+                    ),
+                    "edges", List.of(
+                            Map.of("id", "e1", "source", "input-default", "target", "output-default")
+                    )
+            );
+        }
+        Map<String, Object> graph = readJson(entity.getWorkflowJson());
+        graph.put("workflowId", entity.getId());
+        graph.put("name", entity.getName());
+        return graph;
     }
 
     public WorkflowDtos.DebugWorkflowResponse debugWorkflow(WorkflowDtos.DebugWorkflowRequest req) {
@@ -84,15 +95,17 @@ public class WorkflowService {
         execution.setInputText(req.input());
         execution.setStatus("RUNNING");
         executionMapper.insert(execution);
+        List<WorkflowDtos.NodeResult> nodeResults = new ArrayList<>();
         emit(eventConsumer, "RUNNING", execution.getId(), Map.of("message", "workflow started"));
 
         try {
             Map<String, Object> workflowMap = req.workflow() != null ? req.workflow() : getDefaultWorkflow();
             WorkflowDtos.WorkflowGraph graph = objectMapper.convertValue(workflowMap, WorkflowDtos.WorkflowGraph.class);
-            WorkflowDtos.DebugOutput output = executeGraph(graph, req.input(), execution.getId(), eventConsumer);
+            WorkflowDtos.DebugOutput output = executeGraph(graph, req.input(), execution.getId(), eventConsumer, nodeResults);
             execution.setStatus("SUCCESS");
             execution.setOutputText(output.text());
             execution.setAudioBase64(output.audioBase64());
+            execution.setNodeResults(writeAnyJson(nodeResults));
             execution.setUpdatedAt(LocalDateTime.now());
             executionMapper.updateById(execution);
             emit(eventConsumer, "SUCCESS", execution.getId(), Map.of("output", output));
@@ -100,13 +113,14 @@ public class WorkflowService {
         } catch (WorkflowNodeException e) {
             execution.setStatus(e.status());
             execution.setErrorMessage(e.getMessage());
+            execution.setNodeResults(writeAnyJson(nodeResults));
             execution.setUpdatedAt(LocalDateTime.now());
             executionMapper.updateById(execution);
-            emit(eventConsumer, "NODE_ERROR", execution.getId(), Map.of("errorCode", e.code(), "message", e.getMessage()));
             return new WorkflowDtos.DebugWorkflowResponse(false, execution.getId(), e.status(), e.code(), null, e.getMessage());
         } catch (Exception e) {
             execution.setStatus("FAILED");
             execution.setErrorMessage(e.getMessage());
+            execution.setNodeResults(writeAnyJson(nodeResults));
             execution.setUpdatedAt(LocalDateTime.now());
             executionMapper.updateById(execution);
             emit(eventConsumer, "FAILED", execution.getId(), Map.of("errorCode", "INTERNAL_ERROR", "message", e.getMessage()));
@@ -119,6 +133,7 @@ public class WorkflowService {
         if (entity == null) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "execution not found");
         }
+        List<WorkflowDtos.NodeResult> nodeResults = parseNodeResults(entity.getNodeResults());
         return new WorkflowDtos.WorkflowExecutionResponse(
                 entity.getId(),
                 entity.getWorkflowId(),
@@ -126,15 +141,68 @@ public class WorkflowService {
                 entity.getStatus(),
                 entity.getOutputText(),
                 entity.getAudioBase64(),
-                entity.getErrorMessage()
+                entity.getErrorMessage(),
+                nodeResults
         );
+    }
+
+    public List<WorkflowDtos.WorkflowDefinitionResponse> listWorkflows() {
+        return definitionMapper.selectList(new LambdaQueryWrapper<WorkflowDefinitionEntity>().orderByDesc(WorkflowDefinitionEntity::getId))
+                .stream()
+                .map((entity) -> {
+                    Map<String, Object> graph = readJson(entity.getWorkflowJson());
+                    return new WorkflowDtos.WorkflowDefinitionResponse(
+                            entity.getId(),
+                            entity.getName(),
+                            graph,
+                            entity.getIsDraft() != null && entity.getIsDraft() == 1,
+                            entity.getIsPublished() != null && entity.getIsPublished() == 1
+                    );
+                })
+                .toList();
+    }
+
+    public WorkflowDtos.WorkflowDefinitionResponse getWorkflow(Long workflowId) {
+        WorkflowDefinitionEntity entity = definitionMapper.selectById(workflowId);
+        if (entity == null) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "workflow not found");
+        }
+        Map<String, Object> graph = readJson(entity.getWorkflowJson());
+        return new WorkflowDtos.WorkflowDefinitionResponse(
+                entity.getId(),
+                entity.getName(),
+                graph,
+                entity.getIsDraft() != null && entity.getIsDraft() == 1,
+                entity.getIsPublished() != null && entity.getIsPublished() == 1
+        );
+    }
+
+    public void deleteWorkflow(Long workflowId) {
+        int count = definitionMapper.deleteById(workflowId);
+        if (count == 0) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "workflow not found");
+        }
+    }
+
+    public WorkflowDtos.WorkflowExecutionResponse getLatestExecution(Long workflowId) {
+        WorkflowExecutionEntity entity = executionMapper.selectOne(
+                new LambdaQueryWrapper<WorkflowExecutionEntity>()
+                        .eq(WorkflowExecutionEntity::getWorkflowId, workflowId)
+                        .orderByDesc(WorkflowExecutionEntity::getId)
+                        .last("limit 1")
+        );
+        if (entity == null) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "execution not found");
+        }
+        return getExecution(entity.getId());
     }
 
     private WorkflowDtos.DebugOutput executeGraph(
             WorkflowDtos.WorkflowGraph graph,
             String input,
             Long executionId,
-            Consumer<DebugEvent> eventConsumer
+            Consumer<DebugEvent> eventConsumer,
+            List<WorkflowDtos.NodeResult> nodeResults
     ) throws Exception {
         List<WorkflowDtos.Node> sorted = topologicalSort(graph.nodes(), graph.edges());
         Map<String, Map<String, String>> values = new HashMap<>();
@@ -142,24 +210,50 @@ public class WorkflowService {
         for (WorkflowDtos.Node node : sorted) {
             emit(eventConsumer, "NODE_START", executionId, Map.of("nodeId", node.id(), "nodeType", node.type()));
             if ("input".equals(node.type())) {
+                long startMs = System.currentTimeMillis();
                 values.put(node.id(), Map.of("text", input));
+                long dur = Math.max(0, System.currentTimeMillis() - startMs);
+                nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), "SUCCESS", dur, input, null));
                 emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "text", input));
                 continue;
             }
             Map<String, String> prev = findIncomingValue(node.id(), graph.edges(), values);
             if ("llm".equals(node.type())) {
                 String prompt = prev.getOrDefault("text", input);
-                String llmText = executeWithRetry(() -> runWithTimeout(() -> "【LLM模拟】" + prompt));
-                values.put(node.id(), Map.of("text", llmText));
-                emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "text", llmText));
+                long startMs = System.currentTimeMillis();
+                try {
+                    String llmText = executeWithRetry(() -> runWithTimeout(() -> "【LLM模拟】" + prompt));
+                    values.put(node.id(), Map.of("text", llmText));
+                    long dur = Math.max(0, System.currentTimeMillis() - startMs);
+                    nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), "SUCCESS", dur, llmText, null));
+                    emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "text", llmText));
+                } catch (WorkflowNodeException e) {
+                    long dur = Math.max(0, System.currentTimeMillis() - startMs);
+                    nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), e.status(), dur, null, e.code()));
+                    emit(eventConsumer, "NODE_ERROR", executionId, Map.of("nodeId", node.id(), "nodeType", node.type(), "errorCode", e.code(), "message", e.getMessage()));
+                    throw e;
+                }
             } else if ("tool_tts".equals(node.type())) {
                 String text = prev.getOrDefault("text", "");
-                byte[] wav = executeWithRetry(() -> runWithTimeout(() -> generateSimpleWav()));
-                values.put(node.id(), Map.of("text", text, "audioBase64", Base64.getEncoder().encodeToString(wav), "contentType", "audio/wav"));
-                emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "audioReady", true));
+                long startMs = System.currentTimeMillis();
+                try {
+                    byte[] wav = executeWithRetry(() -> runWithTimeout(() -> generateSimpleWav()));
+                    values.put(node.id(), Map.of("text", text, "audioBase64", Base64.getEncoder().encodeToString(wav), "contentType", "audio/wav"));
+                    long dur = Math.max(0, System.currentTimeMillis() - startMs);
+                    nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), "SUCCESS", dur, text, null));
+                    emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "audioReady", true));
+                } catch (WorkflowNodeException e) {
+                    long dur = Math.max(0, System.currentTimeMillis() - startMs);
+                    nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), e.status(), dur, null, e.code()));
+                    emit(eventConsumer, "NODE_ERROR", executionId, Map.of("nodeId", node.id(), "nodeType", node.type(), "errorCode", e.code(), "message", e.getMessage()));
+                    throw e;
+                }
             } else if ("output".equals(node.type())) {
                 output = prev;
                 values.put(node.id(), output);
+                long startMs = System.currentTimeMillis();
+                long dur = Math.max(0, System.currentTimeMillis() - startMs);
+                nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), "SUCCESS", dur, output.get("text"), null));
                 emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "text", output.get("text")));
             }
         }
@@ -257,6 +351,25 @@ public class WorkflowService {
             return objectMapper.writeValueAsString(map);
         } catch (JsonProcessingException e) {
             throw new RuntimeException("Cannot serialize workflow json");
+        }
+    }
+
+    private String writeAnyJson(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (JsonProcessingException e) {
+            return null;
+        }
+    }
+
+    private List<WorkflowDtos.NodeResult> parseNodeResults(String json) {
+        if (json == null || json.isBlank()) {
+            return List.of();
+        }
+        try {
+            return objectMapper.readValue(json, new TypeReference<List<WorkflowDtos.NodeResult>>() {});
+        } catch (Exception e) {
+            return List.of();
         }
     }
 
