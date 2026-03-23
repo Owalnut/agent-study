@@ -9,18 +9,16 @@ import com.walnut.agent.entity.WorkflowDefinitionEntity;
 import com.walnut.agent.entity.WorkflowExecutionEntity;
 import com.walnut.agent.mapper.WorkflowDefinitionMapper;
 import com.walnut.agent.mapper.WorkflowExecutionMapper;
+import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.http.HttpStatus;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
@@ -29,6 +27,7 @@ import java.util.concurrent.ExecutionException;
 
 @Service
 public class WorkflowService {
+    private static final Logger log = LoggerFactory.getLogger(WorkflowService.class);
     private final WorkflowDefinitionMapper definitionMapper;
     private final WorkflowExecutionMapper executionMapper;
     private final ObjectMapper objectMapper;
@@ -36,11 +35,12 @@ public class WorkflowService {
     private final int retryTimes;
     private final long retryBackoffMs;
     private final int retryBackoffMultiplier;
-    private final HttpClient httpClient;
+    private final ChatClientFactory chatClientFactory;
 
     public WorkflowService(
             WorkflowDefinitionMapper definitionMapper,
             WorkflowExecutionMapper executionMapper,
+            ChatClientFactory chatClientFactory,
             ObjectMapper objectMapper,
             @Value("${workflow.node-timeout-ms}") int nodeTimeoutMs,
             @Value("${workflow.retry-times}") int retryTimes,
@@ -49,14 +49,12 @@ public class WorkflowService {
     ) {
         this.definitionMapper = definitionMapper;
         this.executionMapper = executionMapper;
+        this.chatClientFactory = chatClientFactory;
         this.objectMapper = objectMapper;
         this.nodeTimeoutMs = nodeTimeoutMs;
         this.retryTimes = retryTimes;
         this.retryBackoffMs = retryBackoffMs;
         this.retryBackoffMultiplier = retryBackoffMultiplier;
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofMillis(Math.max(1000, nodeTimeoutMs)))
-                .build();
     }
 
     public WorkflowDtos.WorkflowDefinitionResponse saveWorkflow(WorkflowDtos.SaveWorkflowRequest req) {
@@ -358,77 +356,45 @@ public class WorkflowService {
         if (apiKey == null || apiKey.isBlank()) {
             throw new WorkflowNodeException("NODE_CONFIG_ERROR", "FAILED", "DeepSeek apiKey is required", null);
         }
-
-        String endpoint = buildDeepSeekEndpoint(baseUrl);
-        Map<String, Object> reqBody = Map.of(
-                "model", model,
-                "temperature", temperature,
-                "stream", false,
-                "messages", List.of(Map.of("role", "user", "content", prompt == null ? "" : prompt))
-        );
-
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(endpoint))
-                .timeout(Duration.ofMillis(Math.max(1000, nodeTimeoutMs)))
-                .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + apiKey.trim())
-                .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(reqBody)))
-                .build();
-
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-        if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            String errBody = response.body() == null ? "" : response.body();
-            String errMsg = errBody.length() > 300 ? errBody.substring(0, 300) + "..." : errBody;
-            throw new WorkflowNodeException(
-                    "LLM_PROVIDER_ERROR",
-                    "FAILED",
-                    "DeepSeek request failed: HTTP " + response.statusCode() + " " + errMsg,
-                    null
-            );
-        }
-        return parseDeepSeekResponseText(response.body());
-    }
-
-    private String buildDeepSeekEndpoint(String baseUrl) {
-        String trimmed = baseUrl.trim();
-        while (trimmed.endsWith("/")) {
-            trimmed = trimmed.substring(0, trimmed.length() - 1);
-        }
-        // Compatible with both:
-        // 1) https://api.deepseek.com/v1
-        // 2) https://api.deepseek.com/v1/chat/completions
-        if (trimmed.endsWith("/chat/completions")) {
-            return trimmed;
-        }
-        return trimmed + "/chat/completions";
-    }
-
-    private String parseDeepSeekResponseText(String body) {
         try {
-            Map<String, Object> root = objectMapper.readValue(body, new TypeReference<Map<String, Object>>() {});
-            Object choicesObj = root.get("choices");
-            if (!(choicesObj instanceof List<?> choices) || choices.isEmpty()) {
-                throw new WorkflowNodeException("LLM_EMPTY_RESPONSE", "FAILED", "DeepSeek response has no choices", null);
-            }
-            Object firstChoice = choices.get(0);
-            if (!(firstChoice instanceof Map<?, ?> choiceMap)) {
-                throw new WorkflowNodeException("LLM_EMPTY_RESPONSE", "FAILED", "DeepSeek response choice format invalid", null);
-            }
-            Object messageObj = choiceMap.get("message");
-            if (!(messageObj instanceof Map<?, ?> messageMap)) {
-                throw new WorkflowNodeException("LLM_EMPTY_RESPONSE", "FAILED", "DeepSeek response message is missing", null);
-            }
-            Object contentObj = messageMap.get("content");
-            String content = contentObj == null ? "" : String.valueOf(contentObj);
-            if (content.isBlank()) {
+            log.info(
+                    "DeepSeek node execute: baseUrl={}, model={}, temperature={}, promptLen={}",
+                    baseUrl,
+                    model,
+                    temperature,
+                    prompt == null ? 0 : prompt.length()
+            );
+            ChatClient chatClient = chatClientFactory.createDeepSeekClient(baseUrl, apiKey, model, temperature);
+            String content = chatClient.prompt()
+                    .user(prompt == null ? "" : prompt)
+                    .call()
+                    .content();
+            log.info("DeepSeek node response: contentLen={}", content == null ? 0 : content.length());
+            if (content == null || content.isBlank()) {
                 throw new WorkflowNodeException("LLM_EMPTY_RESPONSE", "FAILED", "DeepSeek returned empty content", null);
             }
             return content;
         } catch (WorkflowNodeException e) {
+            log.warn("DeepSeek node failed (known error): code={}, status={}, message={}", e.code(), e.status(), e.getMessage());
             throw e;
         } catch (Exception e) {
-            throw new WorkflowNodeException("LLM_RESPONSE_PARSE_ERROR", "FAILED", "Cannot parse DeepSeek response", e);
+            log.error("DeepSeek node provider error: root={}", getRootMessage(e));
+            throw new WorkflowNodeException(
+                    "LLM_PROVIDER_ERROR",
+                    "FAILED",
+                    "Spring AI DeepSeek call failed: " + getRootMessage(e),
+                    e
+            );
         }
+    }
+
+    private String getRootMessage(Throwable t) {
+        Throwable cur = t;
+        while (cur.getCause() != null) {
+            cur = cur.getCause();
+        }
+        String msg = cur.getMessage();
+        return msg == null || msg.isBlank() ? cur.getClass().getSimpleName() : msg;
     }
 
     private void emit(Consumer<DebugEvent> consumer, String type, Long executionId, Object payload) {

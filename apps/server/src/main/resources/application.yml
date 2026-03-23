@@ -26,7 +26,8 @@ security:
     expiration-days: 365
 
 workflow:
-  node-timeout-ms: 10000
-  retry-times: 3
+  # 调试 deepseek/llm 节点时，避免一次请求超过 10s 就被 Future 超时 + 重试多次导致整体卡住
+  node-timeout-ms: 30000
+  retry-times: 1
   retry-backoff-ms: 200
   retry-backoff-multiplier: 2

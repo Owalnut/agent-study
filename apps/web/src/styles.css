@@ -470,6 +470,26 @@ body,
   cursor: pointer;
 }
 
+.workflow-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.workflow-delete-btn {
+  border: 1px solid #f3c6cc;
+  border-radius: 8px;
+  background: #fff;
+  padding: 8px 12px;
+  cursor: pointer;
+  color: #b42318;
+}
+
+.workflow-delete-btn:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
 .debug-header {
   display: flex;
   justify-content: space-between;

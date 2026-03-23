@@ -313,6 +313,34 @@ export default function App() {
     }
   }
 
+  async function handleDeleteWorkflow(workflowId: number, authToken: string = token): Promise<void> {
+    if (!authToken) {
+      alert("请先登录/加载工作流");
+      return;
+    }
+    const ok = confirm(`确定删除该工作流（ID=${workflowId}）吗？`);
+    if (!ok) return;
+    try {
+      const resp = await fetch(`${API_BASE}/api/workflows/${workflowId}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${authToken}` }
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(text || `delete workflow failed: ${resp.status}`);
+      }
+
+      // 如果删除的是当前工作流，重置画布与本地状态
+      if (currentWorkflowId === workflowId) {
+        handleNewWorkflow();
+        setLoadModalOpen(false);
+      }
+      await loadWorkflowsList(authToken);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   const workflowPayload = useMemo(
     () => ({
       nodes: nodes.map((node) => {
@@ -1144,9 +1172,14 @@ export default function App() {
                         {w.published ? (w.draft ? " / 发布" : "发布") : ""}
                       </div>
                     </div>
-                    <button className="workflow-load-btn" onClick={() => void handleLoadWorkflow(w.id)}>
-                      加载
-                    </button>
+                    <div className="workflow-actions">
+                      <button className="workflow-load-btn" onClick={() => void handleLoadWorkflow(w.id)}>
+                        加载
+                      </button>
+                      <button className="workflow-delete-btn" onClick={() => void handleDeleteWorkflow(w.id)} disabled={workflowsLoading}>
+                        删除
+                      </button>
+                    </div>
                   </div>
                 ))
               )}

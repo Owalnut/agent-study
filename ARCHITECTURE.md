@@ -211,7 +211,37 @@ sequenceDiagram
 
 ---
 
-## 10. 演进方向（非当前必现）
+## 10. LangChain / Spring AI 应用现状
+
+当前实现已按“AI/LLM 层”拆分思路接入 **Spring AI**，并保留现有自研 DAG 执行引擎；**LangChain 暂未引入**。
+
+### 10.1 Spring AI 已落地能力
+
+- 后端引入 `spring-ai-starter-model-openai`，采用 OpenAI 兼容协议接入 DeepSeek；
+- `WorkflowService` 在执行 `llm` 节点时，通过 `ChatClientFactory` 动态创建 `ChatClient`；
+- 模型参数由节点配置驱动：`baseUrl / apiKey / model / temperature`；
+- Prompt 仍由工作流变量模板（`{{input}}` + 自定义输入参数）在服务端渲染后提交给模型。
+
+### 10.2 与当前分层架构的对应关系
+
+- **Core / Engine 层**：继续负责 DAG 拓扑、节点调度、重试超时、事件回调；
+- **AI / LLM 层**：由 Spring AI 提供统一调用接口，负责模型请求与响应抽象；
+- **Factory 模式**：`ChatClientFactory` 根据节点配置动态产出客户端，便于后续扩展多模型。
+
+### 10.3 LangChain 当前状态
+
+- 代码中尚未引入 LangChain（Java/JS）依赖；
+- 当前工作流编排、变量池、节点路由由本项目引擎自行实现。
+
+### 10.4 后续可演进方向
+
+- 在 `ChatClientFactory` 内扩展多厂商（如 DashScope、OpenAI、DeepSeek）路由策略；
+- 若需要更复杂 Agent 能力（工具调用链、长期记忆、规划器），再逐步引入 LangChain；
+- 保持“引擎层稳定 + AI 接入层可替换”的演进路径，降低重构风险。
+
+---
+
+## 11. 演进方向（非当前必现）
 
 - **执行异步化**（队列、任务表、轮询/推送）
 - **多租户 / 权限模型** 细化
@@ -221,7 +251,7 @@ sequenceDiagram
 
 ---
 
-## 11. 相关文档
+## 12. 相关文档
 
 - [README.md](./README.md) — 快速启动与默认账号
 - [SUMMARY.md](./SUMMARY.md) — 项目背景与更偏「产品/过程」的总结
