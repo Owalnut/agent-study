@@ -17,13 +17,32 @@ const API_BASE = "http://localhost:8787";
 const WS_BASE = "ws://localhost:8787/ws/debug";
 
 type NodeType = "input" | "llm" | "tool_tts" | "output";
-type WorkflowNodeMeta = { id: string; type: NodeType; data?: { name?: string; model?: string; voice?: string } };
+type WorkflowNodeMeta = {
+  id: string;
+  type: NodeType;
+  data?: {
+    name?: string;
+    model?: string;
+    voice?: string;
+    provider?: string;
+    baseUrl?: string;
+    apiKey?: string;
+    temperature?: number;
+    promptTemplate?: string;
+    inputSourceNodeId?: string;
+    inputParams?: DeepSeekInputParam[];
+    outputParams?: DeepSeekOutputParam[];
+  };
+};
 type WorkflowEdge = { id: string; source: string; target: string };
 type Workflow = { nodes: WorkflowNodeMeta[]; edges: WorkflowEdge[] };
 type DebugOutput = { text?: string; audioBase64?: string; contentType?: string };
 type WsEvent = { type: string; executionId?: number; payload?: Record<string, unknown> };
 type OutputParamType = "input" | "reference";
 type OutputParam = { id: string; name: string; type: OutputParamType; value: string };
+type DeepSeekInputParamType = "input" | "reference";
+type DeepSeekInputParam = { id: string; name: string; type: DeepSeekInputParamType; value: string };
+type DeepSeekOutputParam = { id: string; name: string; valueType: "string"; description: string };
 
 type NodeResult = {
   nodeId: string;
@@ -49,6 +68,15 @@ type WorkflowDefinitionResponse = {
   workflow: Workflow;
   draft: boolean;
   published: boolean;
+};
+type DeepSeekConfig = {
+  baseUrl: string;
+  apiKey: string;
+  temperature: number;
+  model: string;
+  promptTemplate: string;
+  inputParams: DeepSeekInputParam[];
+  outputParams: DeepSeekOutputParam[];
 };
 
 type FlowNode = Node<{ label: string; nodeType: NodeType }, "workflowNode"> & { meta: WorkflowNodeMeta };
@@ -107,6 +135,15 @@ export default function App() {
   const [logs, setLogs] = useState<string[]>([]);
   const [outputConfigs, setOutputConfigs] = useState<Record<string, OutputParam[]>>({});
   const [outputTemplates, setOutputTemplates] = useState<Record<string, string>>({});
+  const [deepSeekConfig, setDeepSeekConfig] = useState<DeepSeekConfig>({
+    baseUrl: "",
+    apiKey: "",
+    temperature: 0.7,
+    model: "deepseek-chat",
+    promptTemplate: "",
+    inputParams: [],
+    outputParams: []
+  });
   const [loadModalOpen, setLoadModalOpen] = useState(false);
   const [workflowsList, setWorkflowsList] = useState<WorkflowDefinitionResponse[]>([]);
   const [workflowsLoading, setWorkflowsLoading] = useState(false);
@@ -298,6 +335,11 @@ export default function App() {
   const selectedOutputParams = selectedNode && selectedNode.type === "output" ? outputConfigs[selectedNode.id] || [] : [];
   const selectedOutputTemplate =
     selectedNode && selectedNode.type === "output" ? outputTemplates[selectedNode.id] ?? "{{output}}" : "{{output}}";
+  const isDeepSeekNode =
+    selectedNode?.type === "llm" &&
+    ((selectedNode.data?.name ?? "").toLowerCase().includes("deepseek") ||
+      selectedNode.data?.provider === "deepseek" ||
+      selectedNode.data?.model === "deepseek-chat");
 
   const referenceOptions = useMemo(() => {
     return nodes
@@ -311,6 +353,91 @@ export default function App() {
         { label: `${n.data.label}.audioBase64`, value: `${n.id}.audioBase64` }
       ]);
   }, [nodes]);
+
+  const deepSeekReferenceOptions = useMemo(() => {
+    if (!selectedNode) return [];
+    const previousNodeIds = new Set(
+      edges.filter((e) => e.target === selectedNode.id).map((e) => e.source)
+    );
+    return nodes
+      .filter((n) => previousNodeIds.has(n.id))
+      .flatMap((n) => [
+        { label: `${n.data.label}.text`, value: `${n.id}.text` },
+        { label: `${n.data.label}.audioBase64`, value: `${n.id}.audioBase64` }
+      ]);
+  }, [edges, nodes, selectedNode]);
+
+  useEffect(() => {
+    if (!isDeepSeekNode || !selectedNode) return;
+    const data = selectedNode.data ?? {};
+    setDeepSeekConfig({
+      baseUrl: data.baseUrl ?? "",
+      apiKey: data.apiKey ?? "",
+      temperature: typeof data.temperature === "number" ? data.temperature : 0.7,
+      model: "deepseek-chat",
+      promptTemplate: data.promptTemplate ?? "",
+      inputParams: data.inputParams ?? [],
+      outputParams: data.outputParams ?? []
+    });
+  }, [isDeepSeekNode, selectedNode]);
+
+  function persistSelectedNodeData(nodeId: string, nextData: WorkflowNodeMeta["data"]) {
+    setNodes((prev) =>
+      prev.map((node) => {
+        if (node.id !== nodeId) return node;
+        const prevMeta = (node as unknown as { meta?: WorkflowNodeMeta }).meta;
+        const mergedMeta: WorkflowNodeMeta = {
+          id: nodeId,
+          type: prevMeta?.type ?? ((node.data as unknown as { nodeType?: NodeType }).nodeType ?? "input"),
+          data: {
+            ...(prevMeta?.data ?? {}),
+            ...(nextData ?? {})
+          }
+        };
+        return {
+          ...node,
+          meta: mergedMeta,
+          data: {
+            ...node.data,
+            label: mergedMeta.data?.name ?? node.data.label
+          }
+        };
+      })
+    );
+    setSelectedNode((prev) => {
+      if (!prev || prev.id !== nodeId) return prev;
+      return {
+        ...prev,
+        data: {
+          ...(prev.data ?? {}),
+          ...(nextData ?? {})
+        }
+      };
+    });
+  }
+
+  function saveDeepSeekConfig() {
+    if (!selectedNode) return;
+    const baseUrl = deepSeekConfig.baseUrl.trim();
+    if (!baseUrl) {
+      alert("DeepSeek 模型接口地址为必填项");
+      return;
+    }
+    const payload: WorkflowNodeMeta["data"] = {
+      ...(selectedNode.data ?? {}),
+      name: selectedNode.data?.name ?? "DeepSeek",
+      provider: "deepseek",
+      baseUrl,
+      apiKey: deepSeekConfig.apiKey,
+      temperature: Number(deepSeekConfig.temperature),
+      model: "deepseek-chat",
+      promptTemplate: deepSeekConfig.promptTemplate,
+      inputParams: deepSeekConfig.inputParams,
+      outputParams: deepSeekConfig.outputParams
+    };
+    persistSelectedNodeData(selectedNode.id, payload);
+    setLogs((prev) => [...prev, `[CONFIG] DeepSeek config saved for ${selectedNode.id}`]);
+  }
 
   async function handleDebug(): Promise<void> {
     if (!token) return;
@@ -509,6 +636,51 @@ export default function App() {
     setOutputConfigs((prev) => ({
       ...prev,
       [nodeId]: (prev[nodeId] || []).filter((item) => item.id !== paramId)
+    }));
+  }
+
+  function addDeepSeekInputParam() {
+    setDeepSeekConfig((prev) => ({
+      ...prev,
+      inputParams: [...prev.inputParams, { id: crypto.randomUUID().slice(0, 8), name: "", type: "input", value: "" }]
+    }));
+  }
+
+  function updateDeepSeekInputParam(paramId: string, patch: Partial<DeepSeekInputParam>) {
+    setDeepSeekConfig((prev) => ({
+      ...prev,
+      inputParams: prev.inputParams.map((item) => (item.id === paramId ? { ...item, ...patch } : item))
+    }));
+  }
+
+  function removeDeepSeekInputParam(paramId: string) {
+    setDeepSeekConfig((prev) => ({
+      ...prev,
+      inputParams: prev.inputParams.filter((item) => item.id !== paramId)
+    }));
+  }
+
+  function addDeepSeekOutputParam() {
+    setDeepSeekConfig((prev) => ({
+      ...prev,
+      outputParams: [
+        ...prev.outputParams,
+        { id: crypto.randomUUID().slice(0, 8), name: "", valueType: "string", description: "" }
+      ]
+    }));
+  }
+
+  function updateDeepSeekOutputParam(paramId: string, patch: Partial<DeepSeekOutputParam>) {
+    setDeepSeekConfig((prev) => ({
+      ...prev,
+      outputParams: prev.outputParams.map((item) => (item.id === paramId ? { ...item, ...patch } : item))
+    }));
+  }
+
+  function removeDeepSeekOutputParam(paramId: string) {
+    setDeepSeekConfig((prev) => ({
+      ...prev,
+      outputParams: prev.outputParams.filter((item) => item.id !== paramId)
     }));
   }
 
@@ -788,6 +960,145 @@ export default function App() {
                     onChange={(e) => setOutputTemplates((prev) => ({ ...prev, [selectedNode.id]: e.target.value }))}
                   />
                   <button className="save-config-btn">保存配置</button>
+                </>
+              ) : isDeepSeekNode ? (
+                <>
+                  <label className="config-label">模型接口地址（必填）</label>
+                  <input
+                    className="config-input"
+                    placeholder="例如: https://api.deepseek.com/v1"
+                    value={deepSeekConfig.baseUrl}
+                    onChange={(e) => setDeepSeekConfig((prev) => ({ ...prev, baseUrl: e.target.value }))}
+                  />
+                  <label className="config-label">API 密钥</label>
+                  <input
+                    type="password"
+                    className="config-input"
+                    placeholder="请输入 API Key"
+                    value={deepSeekConfig.apiKey}
+                    onChange={(e) => setDeepSeekConfig((prev) => ({ ...prev, apiKey: e.target.value }))}
+                  />
+                  <label className="config-label">模型名称</label>
+                  <input className="config-input" value="deepseek-chat" readOnly />
+                  <label className="config-label">输入参数配置</label>
+                  <button className="add-param-btn" onClick={addDeepSeekInputParam}>
+                    ＋ 添加
+                  </button>
+                  <div className="output-table">
+                    {deepSeekConfig.inputParams.length === 0 ? (
+                      <div className="hint">暂无输入参数，点击“添加”创建</div>
+                    ) : (
+                      deepSeekConfig.inputParams.map((item) => (
+                        <div className="output-row" key={item.id}>
+                          <input
+                            className="config-input inline-input"
+                            placeholder="参数名"
+                            value={item.name}
+                            onChange={(e) => updateDeepSeekInputParam(item.id, { name: e.target.value })}
+                          />
+                          <select
+                            className="config-input inline-input"
+                            value={item.type}
+                            onChange={(e) =>
+                              updateDeepSeekInputParam(item.id, { type: e.target.value as DeepSeekInputParamType, value: "" })
+                            }
+                          >
+                            <option value="input">输入</option>
+                            <option value="reference">引用</option>
+                          </select>
+                          {item.type === "input" ? (
+                            <input
+                              className="config-input inline-input"
+                              placeholder="请输入值"
+                              value={item.value}
+                              onChange={(e) => updateDeepSeekInputParam(item.id, { value: e.target.value })}
+                            />
+                          ) : (
+                            <select
+                              className="config-input inline-input"
+                              value={item.value}
+                              onChange={(e) => updateDeepSeekInputParam(item.id, { value: e.target.value })}
+                            >
+                              <option value="">选择前置节点引用</option>
+                              {deepSeekReferenceOptions.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                          <button className="remove-btn" onClick={() => removeDeepSeekInputParam(item.id)}>
+                            移除
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <label className="config-label">用户提示词（支持 {"{{input}}" }）</label>
+                  <textarea
+                    className="config-area"
+                    placeholder={"# 角色\n你是一位专业的广播节目编辑...\n# 原始内容：{{input}}"}
+                    value={deepSeekConfig.promptTemplate}
+                    onChange={(e) => setDeepSeekConfig((prev) => ({ ...prev, promptTemplate: e.target.value }))}
+                  />
+                  <div className="template-help">
+                    {deepSeekConfig.inputParams.map((item) => (
+                      <button key={item.id} className="chip" onClick={() => setDeepSeekConfig((prev) => ({ ...prev, promptTemplate: `${prev.promptTemplate}{{${item.name || "参数名"}}}` }))}>
+                        {`{{${item.name || "参数名"}}}`}
+                      </button>
+                    ))}
+                  </div>
+                  <label className="config-label">输出参数配置</label>
+                  <button className="add-param-btn" onClick={addDeepSeekOutputParam}>
+                    ＋ 添加
+                  </button>
+                  <div className="output-table">
+                    {deepSeekConfig.outputParams.length === 0 ? (
+                      <div className="hint">暂无输出参数，点击“添加”创建</div>
+                    ) : (
+                      deepSeekConfig.outputParams.map((item) => (
+                        <div className="output-row" key={item.id}>
+                          <input
+                            className="config-input inline-input"
+                            placeholder="变量名"
+                            value={item.name}
+                            onChange={(e) => updateDeepSeekOutputParam(item.id, { name: e.target.value })}
+                          />
+                          <select
+                            className="config-input inline-input"
+                            value={item.valueType}
+                            onChange={(e) => updateDeepSeekOutputParam(item.id, { valueType: e.target.value as "string" })}
+                          >
+                            <option value="string">string</option>
+                          </select>
+                          <input
+                            className="config-input inline-input"
+                            placeholder="描述（可为空）"
+                            value={item.description}
+                            onChange={(e) => updateDeepSeekOutputParam(item.id, { description: e.target.value })}
+                          />
+                          <button className="remove-btn" onClick={() => removeDeepSeekOutputParam(item.id)}>
+                            移除
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <label className="config-label">温度（temperature）</label>
+                  <input
+                    type="range"
+                    min={0}
+                    max={2}
+                    step={0.1}
+                    value={deepSeekConfig.temperature}
+                    onChange={(e) => setDeepSeekConfig((prev) => ({ ...prev, temperature: Number(e.target.value) }))}
+                  />
+                  <div className="temp-tip">
+                    当前值：{deepSeekConfig.temperature.toFixed(1)}。温度越低越严谨，越高越发散。
+                  </div>
+                  <button className="save-config-btn" onClick={saveDeepSeekConfig}>
+                    保存配置
+                  </button>
                 </>
               ) : (
                 <>

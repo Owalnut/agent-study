@@ -30,6 +30,8 @@
 - `apps/server`：后端服务（认证、工作流存储、执行调试）
 - `packages/workflow-engine`：早期 JS 引擎包（当前后端主逻辑已迁移到 Java）
 
+更完整的技术架构说明（图示、REST/WebSocket、表结构）见根目录 **[ARCHITECTURE.md](./ARCHITECTURE.md)**。
+
 ---
 
 ## 3. 需求约束与决策记录（已确认）
@@ -244,7 +246,7 @@ MVP 阶段存在以下限制：
 - 执行模型为同步，复杂任务可能阻塞请求线程
 - 未引入缓存、队列、分布式锁等高并发保障
 - 观察性能力较弱（无完整链路日志、指标与追踪）
-- 前端当前仍为 JS，尚未迁移为 `React + TypeScript`
+- 前端已使用 `React + TypeScript`（早期文档表述可能滞后，以代码为准）
 
 ---
 

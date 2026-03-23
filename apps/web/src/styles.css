@@ -86,6 +86,16 @@ body,
   min-height: 0;
 }
 
+.panel.left,
+.panel.right {
+  overflow-y: auto;
+}
+
+.panel.right {
+  /* Leave space so last config items are not visually cramped by the debug drawer. */
+  padding-bottom: 88px;
+}
+
 .left .group-title {
   margin: 12px 0 8px;
   color: #6a7790;
@@ -264,6 +274,12 @@ body,
 .required-row input {
   width: 16px;
   height: 16px;
+}
+
+.temp-tip {
+  color: #5f6b82;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .hint {

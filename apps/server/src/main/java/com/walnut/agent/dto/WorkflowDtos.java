@@ -31,7 +31,21 @@ public class WorkflowDtos {
             @NotBlank String input
     ) {}
 
-    public record NodeData(String name, String model, String voice) {}
+    public record NodeData(
+            String name,
+            String model,
+            String voice,
+            String provider,
+            String baseUrl,
+            String apiKey,
+            Double temperature,
+            String promptTemplate,
+            String inputSourceNodeId,
+            List<NodeInputParam> inputParams,
+            List<NodeOutputParam> outputParams
+    ) {}
+    public record NodeInputParam(String name, String type, String value) {}
+    public record NodeOutputParam(String name, String valueType, String description) {}
     public record Node(String id, String type, NodeData data) {}
     public record Edge(String id, String source, String target) {}
     public record WorkflowGraph(List<Node> nodes, List<Edge> edges) {}

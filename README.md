@@ -13,6 +13,8 @@
 - `apps/server`: Spring Boot 后端服务
 - `packages/workflow-engine`: 预留工作流包（后续可并入 Java 引擎）
 
+系统整体架构（模块、数据流、接口与存储）见 **[ARCHITECTURE.md](./ARCHITECTURE.md)**。
+
 ## 本地启动
 
 前置条件：

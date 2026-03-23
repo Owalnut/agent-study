@@ -14,12 +14,18 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Consumer;
+import java.util.concurrent.ExecutionException;
 
 @Service
 public class WorkflowService {
@@ -30,6 +36,7 @@ public class WorkflowService {
     private final int retryTimes;
     private final long retryBackoffMs;
     private final int retryBackoffMultiplier;
+    private final HttpClient httpClient;
 
     public WorkflowService(
             WorkflowDefinitionMapper definitionMapper,
@@ -47,6 +54,9 @@ public class WorkflowService {
         this.retryTimes = retryTimes;
         this.retryBackoffMs = retryBackoffMs;
         this.retryBackoffMultiplier = retryBackoffMultiplier;
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofMillis(Math.max(1000, nodeTimeoutMs)))
+                .build();
     }
 
     public WorkflowDtos.WorkflowDefinitionResponse saveWorkflow(WorkflowDtos.SaveWorkflowRequest req) {
@@ -219,10 +229,11 @@ public class WorkflowService {
             }
             Map<String, String> prev = findIncomingValue(node.id(), graph.edges(), values);
             if ("llm".equals(node.type())) {
-                String prompt = prev.getOrDefault("text", input);
+                Map<String, String> promptVars = resolvePromptVariables(node, prev, values, input);
+                String prompt = buildPrompt(node, promptVars);
                 long startMs = System.currentTimeMillis();
                 try {
-                    String llmText = executeWithRetry(() -> runWithTimeout(() -> "【LLM模拟】" + prompt));
+                    String llmText = executeWithRetry(() -> runWithTimeout(() -> callLlm(node, prompt)));
                     values.put(node.id(), Map.of("text", llmText));
                     long dur = Math.max(0, System.currentTimeMillis() - startMs);
                     nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), "SUCCESS", dur, llmText, null));
@@ -260,6 +271,166 @@ public class WorkflowService {
         return new WorkflowDtos.DebugOutput(output.get("text"), output.get("audioBase64"), output.getOrDefault("contentType", "audio/wav"));
     }
 
+    private String resolveLlmInput(
+            WorkflowDtos.Node node,
+            Map<String, String> prev,
+            Map<String, Map<String, String>> values,
+            String fallbackInput
+    ) {
+        WorkflowDtos.NodeData data = node.data();
+        String sourceNodeId = data == null ? null : data.inputSourceNodeId();
+        if (sourceNodeId != null && !sourceNodeId.isBlank()) {
+            Map<String, String> sourceVal = values.get(sourceNodeId);
+            if (sourceVal != null) {
+                String sourceText = sourceVal.get("text");
+                if (sourceText != null && !sourceText.isBlank()) {
+                    return sourceText;
+                }
+            }
+        }
+        String prevText = prev.get("text");
+        if (prevText != null && !prevText.isBlank()) {
+            return prevText;
+        }
+        return fallbackInput == null ? "" : fallbackInput;
+    }
+
+    private Map<String, String> resolvePromptVariables(
+            WorkflowDtos.Node node,
+            Map<String, String> prev,
+            Map<String, Map<String, String>> values,
+            String fallbackInput
+    ) {
+        Map<String, String> vars = new LinkedHashMap<>();
+        String defaultInput = resolveLlmInput(node, prev, values, fallbackInput);
+        vars.put("input", defaultInput == null ? "" : defaultInput);
+        WorkflowDtos.NodeData data = node.data();
+        if (data == null || data.inputParams() == null) {
+            return vars;
+        }
+        for (WorkflowDtos.NodeInputParam param : data.inputParams()) {
+            if (param == null || param.name() == null || param.name().isBlank()) {
+                continue;
+            }
+            String value = resolveInputParamValue(param, values);
+            vars.put(param.name(), value == null ? "" : value);
+        }
+        return vars;
+    }
+
+    private String resolveInputParamValue(WorkflowDtos.NodeInputParam param, Map<String, Map<String, String>> values) {
+        if ("reference".equals(param.type())) {
+            String ref = param.value();
+            if (ref == null || ref.isBlank()) {
+                return "";
+            }
+            String[] parts = ref.split("\\.", 2);
+            String nodeId = parts[0];
+            String field = parts.length > 1 ? parts[1] : "text";
+            return values.getOrDefault(nodeId, Map.of()).getOrDefault(field, "");
+        }
+        return param.value() == null ? "" : param.value();
+    }
+
+    private String buildPrompt(WorkflowDtos.Node node, Map<String, String> promptVars) {
+        WorkflowDtos.NodeData data = node.data();
+        String template = data == null ? null : data.promptTemplate();
+        if (template == null || template.isBlank()) {
+            return promptVars.getOrDefault("input", "");
+        }
+        String prompt = template;
+        for (Map.Entry<String, String> entry : promptVars.entrySet()) {
+            prompt = prompt.replace("{{" + entry.getKey() + "}}", entry.getValue() == null ? "" : entry.getValue());
+        }
+        return prompt;
+    }
+
+    private String callLlm(WorkflowDtos.Node node, String prompt) throws Exception {
+        WorkflowDtos.NodeData data = node.data();
+        String baseUrl = data == null ? null : data.baseUrl();
+        String apiKey = data == null ? null : data.apiKey();
+        String model = data == null || data.model() == null || data.model().isBlank() ? "deepseek-chat" : data.model();
+        Double temperature = data == null || data.temperature() == null ? 0.7 : data.temperature();
+
+        if (baseUrl == null || baseUrl.isBlank()) {
+            throw new WorkflowNodeException("NODE_CONFIG_ERROR", "FAILED", "DeepSeek baseUrl is required", null);
+        }
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new WorkflowNodeException("NODE_CONFIG_ERROR", "FAILED", "DeepSeek apiKey is required", null);
+        }
+
+        String endpoint = buildDeepSeekEndpoint(baseUrl);
+        Map<String, Object> reqBody = Map.of(
+                "model", model,
+                "temperature", temperature,
+                "stream", false,
+                "messages", List.of(Map.of("role", "user", "content", prompt == null ? "" : prompt))
+        );
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(endpoint))
+                .timeout(Duration.ofMillis(Math.max(1000, nodeTimeoutMs)))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + apiKey.trim())
+                .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(reqBody)))
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            String errBody = response.body() == null ? "" : response.body();
+            String errMsg = errBody.length() > 300 ? errBody.substring(0, 300) + "..." : errBody;
+            throw new WorkflowNodeException(
+                    "LLM_PROVIDER_ERROR",
+                    "FAILED",
+                    "DeepSeek request failed: HTTP " + response.statusCode() + " " + errMsg,
+                    null
+            );
+        }
+        return parseDeepSeekResponseText(response.body());
+    }
+
+    private String buildDeepSeekEndpoint(String baseUrl) {
+        String trimmed = baseUrl.trim();
+        while (trimmed.endsWith("/")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1);
+        }
+        // Compatible with both:
+        // 1) https://api.deepseek.com/v1
+        // 2) https://api.deepseek.com/v1/chat/completions
+        if (trimmed.endsWith("/chat/completions")) {
+            return trimmed;
+        }
+        return trimmed + "/chat/completions";
+    }
+
+    private String parseDeepSeekResponseText(String body) {
+        try {
+            Map<String, Object> root = objectMapper.readValue(body, new TypeReference<Map<String, Object>>() {});
+            Object choicesObj = root.get("choices");
+            if (!(choicesObj instanceof List<?> choices) || choices.isEmpty()) {
+                throw new WorkflowNodeException("LLM_EMPTY_RESPONSE", "FAILED", "DeepSeek response has no choices", null);
+            }
+            Object firstChoice = choices.get(0);
+            if (!(firstChoice instanceof Map<?, ?> choiceMap)) {
+                throw new WorkflowNodeException("LLM_EMPTY_RESPONSE", "FAILED", "DeepSeek response choice format invalid", null);
+            }
+            Object messageObj = choiceMap.get("message");
+            if (!(messageObj instanceof Map<?, ?> messageMap)) {
+                throw new WorkflowNodeException("LLM_EMPTY_RESPONSE", "FAILED", "DeepSeek response message is missing", null);
+            }
+            Object contentObj = messageMap.get("content");
+            String content = contentObj == null ? "" : String.valueOf(contentObj);
+            if (content.isBlank()) {
+                throw new WorkflowNodeException("LLM_EMPTY_RESPONSE", "FAILED", "DeepSeek returned empty content", null);
+            }
+            return content;
+        } catch (WorkflowNodeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new WorkflowNodeException("LLM_RESPONSE_PARSE_ERROR", "FAILED", "Cannot parse DeepSeek response", e);
+        }
+    }
+
     private void emit(Consumer<DebugEvent> consumer, String type, Long executionId, Object payload) {
         if (consumer == null) return;
         consumer.accept(new DebugEvent(type, executionId, payload));
@@ -272,12 +443,23 @@ public class WorkflowService {
             try {
                 return callable.call();
             } catch (Exception e) {
+                // Provider/config errors are deterministic; fail fast and keep original message.
+                if (e instanceof WorkflowNodeException wne &&
+                        ("NODE_CONFIG_ERROR".equals(wne.code())
+                                || "LLM_PROVIDER_ERROR".equals(wne.code())
+                                || "LLM_EMPTY_RESPONSE".equals(wne.code())
+                                || "LLM_RESPONSE_PARSE_ERROR".equals(wne.code()))) {
+                    throw wne;
+                }
                 last = e;
                 if (i < retryTimes - 1 && backoff > 0) {
                     Thread.sleep(backoff);
                     backoff = backoff * Math.max(1, retryBackoffMultiplier);
                 }
             }
+        }
+        if (last instanceof WorkflowNodeException wne) {
+            throw wne;
         }
         throw new WorkflowNodeException("NODE_RETRY_EXHAUSTED", "FAILED", "Node execution failed after retries", last);
     }
@@ -287,6 +469,15 @@ public class WorkflowService {
         Future<T> future = executor.submit(callable);
         try {
             return future.get(nodeTimeoutMs, TimeUnit.MILLISECONDS);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof WorkflowNodeException wne) {
+                throw wne;
+            }
+            if (cause instanceof Exception ex) {
+                throw ex;
+            }
+            throw new WorkflowNodeException("INTERNAL_ERROR", "FAILED", "Unexpected node execution error", e);
         } catch (TimeoutException e) {
             future.cancel(true);
             throw new WorkflowNodeException("NODE_TIMEOUT", "TIMEOUT", "Node execution timeout", e);
