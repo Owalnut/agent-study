@@ -67,6 +67,20 @@ public class WorkflowService {
         return new WorkflowDtos.WorkflowDefinitionResponse(entity.getId(), entity.getName(), req.workflow(), req.draft(), req.published());
     }
 
+    public WorkflowDtos.WorkflowDefinitionResponse updateWorkflow(Long workflowId, WorkflowDtos.SaveWorkflowRequest req) {
+        WorkflowDefinitionEntity entity = definitionMapper.selectById(workflowId);
+        if (entity == null) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "workflow not found");
+        }
+        entity.setName(req.name());
+        entity.setWorkflowJson(writeJson(req.workflow()));
+        entity.setIsDraft(req.draft() ? 1 : 0);
+        entity.setIsPublished(req.published() ? 1 : 0);
+        entity.setUpdatedAt(LocalDateTime.now());
+        definitionMapper.updateById(entity);
+        return new WorkflowDtos.WorkflowDefinitionResponse(entity.getId(), entity.getName(), req.workflow(), req.draft(), req.published());
+    }
+
     public Map<String, Object> getDefaultWorkflow() {
         WorkflowDefinitionEntity entity = definitionMapper.selectOne(
                 new LambdaQueryWrapper<WorkflowDefinitionEntity>().eq(WorkflowDefinitionEntity::getIsPublished, 1).last("limit 1")
@@ -216,29 +230,79 @@ public class WorkflowService {
         Map<String, Map<String, String>> values = new HashMap<>();
         Map<String, String> output = Map.of("text", input);
         for (WorkflowDtos.Node node : sorted) {
-            emit(eventConsumer, "NODE_START", executionId, Map.of("nodeId", node.id(), "nodeType", node.type()));
             if ("input".equals(node.type())) {
+                Map<String, String> nodeInput = Map.of("input", input == null ? "" : input);
+                emit(eventConsumer, "NODE_START", executionId, Map.of(
+                        "nodeId", node.id(),
+                        "nodeType", node.type(),
+                        "inputPayload", toJson(nodeInput)
+                ));
                 long startMs = System.currentTimeMillis();
-                values.put(node.id(), Map.of("text", input));
+                Map<String, String> nodeOutput = Map.of("text", input == null ? "" : input);
+                values.put(node.id(), nodeOutput);
                 long dur = Math.max(0, System.currentTimeMillis() - startMs);
-                nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), "SUCCESS", dur, input, null));
-                emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "text", input));
+                nodeResults.add(new WorkflowDtos.NodeResult(
+                        node.id(), node.type(), "SUCCESS", dur, input, null, toJson(nodeInput), toJson(nodeOutput), null, null
+                ));
+                emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of(
+                        "nodeId", node.id(),
+                        "text", input,
+                        "outputPayload", toJson(nodeOutput)
+                ));
                 continue;
             }
             Map<String, String> prev = findIncomingValue(node.id(), graph.edges(), values);
+            if (!"llm".equals(node.type())) {
+                emit(eventConsumer, "NODE_START", executionId, Map.of(
+                        "nodeId", node.id(),
+                        "nodeType", node.type(),
+                        "inputPayload", toJson(prev)
+                ));
+            }
             if ("llm".equals(node.type())) {
                 Map<String, String> promptVars = resolvePromptVariables(node, prev, values, input);
                 String prompt = buildPrompt(node, promptVars);
+                WorkflowDtos.NodeData nodeData = node.data();
+                String provider = nodeData == null ? null : nodeData.provider();
+                String model = nodeData == null || nodeData.model() == null || nodeData.model().isBlank()
+                        ? defaultLlmModel(provider)
+                        : nodeData.model();
+                String baseUrl = nodeData == null ? null : nodeData.baseUrl();
+                Double temperature = nodeData == null || nodeData.temperature() == null ? 0.7 : nodeData.temperature();
+                String rawRequestPayload = writeAnyJson(Map.of(
+                        "provider", provider == null ? "" : provider,
+                        "baseUrl", baseUrl == null ? "" : baseUrl,
+                        "model", model,
+                        "temperature", String.valueOf(temperature),
+                        "prompt", prompt == null ? "" : prompt
+                ));
                 long startMs = System.currentTimeMillis();
+                emit(eventConsumer, "NODE_START", executionId, Map.of(
+                        "nodeId", node.id(),
+                        "nodeType", node.type(),
+                        "inputPayload", toJson(prev),
+                        "rawRequestPayload", rawRequestPayload == null ? "" : rawRequestPayload
+                ));
                 try {
                     String llmText = executeWithRetry(() -> runWithTimeout(() -> callLlm(node, prompt)));
-                    values.put(node.id(), Map.of("text", llmText));
+                    Map<String, String> nodeOutput = Map.of("text", llmText);
+                    String rawResponsePayload = writeAnyJson(Map.of("content", llmText == null ? "" : llmText));
+                    values.put(node.id(), nodeOutput);
                     long dur = Math.max(0, System.currentTimeMillis() - startMs);
-                    nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), "SUCCESS", dur, llmText, null));
-                    emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "text", llmText));
+                    nodeResults.add(new WorkflowDtos.NodeResult(
+                            node.id(), node.type(), "SUCCESS", dur, llmText, null, toJson(prev), toJson(nodeOutput), rawRequestPayload, rawResponsePayload
+                    ));
+                    emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of(
+                            "nodeId", node.id(),
+                            "text", llmText,
+                            "outputPayload", toJson(nodeOutput),
+                            "rawResponsePayload", rawResponsePayload == null ? "" : rawResponsePayload
+                    ));
                 } catch (WorkflowNodeException e) {
                     long dur = Math.max(0, System.currentTimeMillis() - startMs);
-                    nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), e.status(), dur, null, e.code()));
+                    nodeResults.add(new WorkflowDtos.NodeResult(
+                            node.id(), node.type(), e.status(), dur, null, e.code(), toJson(prev), null, rawRequestPayload, null
+                    ));
                     emit(eventConsumer, "NODE_ERROR", executionId, Map.of("nodeId", node.id(), "nodeType", node.type(), "errorCode", e.code(), "message", e.getMessage()));
                     throw e;
                 }
@@ -247,13 +311,26 @@ public class WorkflowService {
                 long startMs = System.currentTimeMillis();
                 try {
                     byte[] wav = executeWithRetry(() -> runWithTimeout(() -> generateSimpleWav()));
-                    values.put(node.id(), Map.of("text", text, "audioBase64", Base64.getEncoder().encodeToString(wav), "contentType", "audio/wav"));
+                    Map<String, String> nodeOutput = Map.of(
+                            "text", text,
+                            "audioBase64", Base64.getEncoder().encodeToString(wav),
+                            "contentType", "audio/wav"
+                    );
+                    values.put(node.id(), nodeOutput);
                     long dur = Math.max(0, System.currentTimeMillis() - startMs);
-                    nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), "SUCCESS", dur, text, null));
-                    emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "audioReady", true));
+                    nodeResults.add(new WorkflowDtos.NodeResult(
+                            node.id(), node.type(), "SUCCESS", dur, text, null, toJson(prev), toJson(nodeOutput), null, null
+                    ));
+                    emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of(
+                            "nodeId", node.id(),
+                            "audioReady", true,
+                            "outputPayload", toJson(nodeOutput)
+                    ));
                 } catch (WorkflowNodeException e) {
                     long dur = Math.max(0, System.currentTimeMillis() - startMs);
-                    nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), e.status(), dur, null, e.code()));
+                    nodeResults.add(new WorkflowDtos.NodeResult(
+                            node.id(), node.type(), e.status(), dur, null, e.code(), toJson(prev), null, null, null
+                    ));
                     emit(eventConsumer, "NODE_ERROR", executionId, Map.of("nodeId", node.id(), "nodeType", node.type(), "errorCode", e.code(), "message", e.getMessage()));
                     throw e;
                 }
@@ -262,11 +339,21 @@ public class WorkflowService {
                 values.put(node.id(), output);
                 long startMs = System.currentTimeMillis();
                 long dur = Math.max(0, System.currentTimeMillis() - startMs);
-                nodeResults.add(new WorkflowDtos.NodeResult(node.id(), node.type(), "SUCCESS", dur, output.get("text"), null));
-                emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of("nodeId", node.id(), "text", output.get("text")));
+                nodeResults.add(new WorkflowDtos.NodeResult(
+                        node.id(), node.type(), "SUCCESS", dur, output.get("text"), null, toJson(prev), toJson(output), null, null
+                ));
+                emit(eventConsumer, "NODE_SUCCESS", executionId, Map.of(
+                        "nodeId", node.id(),
+                        "text", output.get("text"),
+                        "outputPayload", toJson(output)
+                ));
             }
         }
         return new WorkflowDtos.DebugOutput(output.get("text"), output.get("audioBase64"), output.getOrDefault("contentType", "audio/wav"));
+    }
+
+    private String toJson(Map<String, String> value) {
+        return writeAnyJson(value == null ? Map.of() : value);
     }
 
     private String resolveLlmInput(

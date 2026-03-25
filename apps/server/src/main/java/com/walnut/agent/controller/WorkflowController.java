@@ -46,6 +46,14 @@ public class WorkflowController {
         return workflowService.saveWorkflow(req);
     }
 
+    @PutMapping("/{workflowId}")
+    public WorkflowDtos.WorkflowDefinitionResponse updateWorkflow(
+            @PathVariable Long workflowId,
+            @Valid @RequestBody WorkflowDtos.SaveWorkflowRequest req
+    ) {
+        return workflowService.updateWorkflow(workflowId, req);
+    }
+
     @PostMapping("/debug")
     public WorkflowDtos.DebugWorkflowResponse debug(@Valid @RequestBody WorkflowDtos.DebugWorkflowRequest req) {
         return workflowService.debugWorkflow(req);

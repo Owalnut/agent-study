@@ -286,6 +286,27 @@ body,
   color: #8a94a9;
 }
 
+.config-save-feedback {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.config-save-feedback.success {
+  background: #ecfdf5;
+  color: #065f46;
+  border-color: #34d399;
+}
+
+.config-save-feedback.error {
+  background: #fef2f2;
+  color: #991b1b;
+  border-color: #f87171;
+}
+
 .debug-drawer {
   background: #fff;
   border: 1px solid #e6e9f3;
@@ -294,6 +315,9 @@ body,
   overflow: hidden;
   min-height: 64px;
   position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 64px;
 }
 
 .debug-drawer.resizing {
@@ -386,6 +410,7 @@ body,
   display: grid;
   gap: 6px;
   margin-bottom: 12px;
+  min-height: 0;
 }
 
 .exec-node-row {
@@ -397,6 +422,31 @@ body,
   border: 1px solid #eef1f6;
   border-radius: 10px;
   background: #fafafa;
+}
+
+.exec-node-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 8px;
+}
+
+.exec-node-card .exec-node-row {
+  border: none;
+  background: transparent;
+  padding: 0;
+}
+
+.exec-node-io {
+  margin-top: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.exec-raw summary {
+  cursor: pointer;
+  color: #374151;
+  font-size: 12px;
 }
 
 .exec-node-dot {
@@ -549,6 +599,8 @@ body,
   margin-top: 10px;
   display: grid;
   gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 textarea {
@@ -565,6 +617,7 @@ textarea {
   border-radius: 8px;
   padding: 10px;
   background: #f7f9fe;
+  min-height: 0;
 }
 
 pre {

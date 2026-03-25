@@ -51,6 +51,10 @@ type NodeResult = {
   durationMs: number | null;
   text: string | null;
   errorCode: string | null;
+  inputPayload?: string | null;
+  outputPayload?: string | null;
+  rawRequestPayload?: string | null;
+  rawResponsePayload?: string | null;
 };
 type WorkflowExecutionResponse = {
   id: number;
@@ -138,6 +142,7 @@ export default function App() {
   const [debugResult, setDebugResult] = useState<DebugOutput | null>(null);
   const [loading, setLoading] = useState(false);
   const [currentWorkflowId, setCurrentWorkflowId] = useState<number | null>(null);
+  const [currentWorkflowName, setCurrentWorkflowName] = useState<string>("");
   const [latestExecution, setLatestExecution] = useState<WorkflowExecutionResponse | null>(null);
   const [liveNodeResults, setLiveNodeResults] = useState<NodeResult[]>([]);
   const [executionStatus, setExecutionStatus] = useState<string>("");
@@ -164,6 +169,10 @@ export default function App() {
     inputParams: [],
     outputParams: []
   });
+  const [configSaveFeedback, setConfigSaveFeedback] = useState<{ kind: "success" | "error"; text: string } | null>(
+    null
+  );
+  const configSaveFeedbackTimerRef = useRef<number | null>(null);
   const [loadModalOpen, setLoadModalOpen] = useState(false);
   const [workflowsList, setWorkflowsList] = useState<WorkflowDefinitionResponse[]>([]);
   const [workflowsLoading, setWorkflowsLoading] = useState(false);
@@ -175,6 +184,19 @@ export default function App() {
     void loginAndLoad();
     return () => wsRef.current?.close();
   }, []);
+
+  useEffect(() => {
+    // 切节点时清空提示，避免误以为上一个节点的保存生效
+    setConfigSaveFeedback(null);
+  }, [selectedNode?.id]);
+
+  function showConfigSaveFeedback(kind: "success" | "error", text: string) {
+    setConfigSaveFeedback({ kind, text });
+    if (configSaveFeedbackTimerRef.current) {
+      window.clearTimeout(configSaveFeedbackTimerRef.current);
+    }
+    configSaveFeedbackTimerRef.current = window.setTimeout(() => setConfigSaveFeedback(null), 1600);
+  }
 
   useEffect(() => {
     if (!isResizingDebugDrawer) return;
@@ -266,6 +288,7 @@ export default function App() {
     setOutputConfigs({});
     setOutputTemplates({});
     setCurrentWorkflowId(null);
+    setCurrentWorkflowName("");
     localStorage.removeItem("walnutAgent.currentWorkflowId");
     setLatestExecution(null);
     setLiveNodeResults([]);
@@ -332,6 +355,7 @@ export default function App() {
       });
       if (!resp.ok) throw new Error(`load workflow failed: ${resp.status}`);
       const def = (await resp.json()) as WorkflowDefinitionResponse;
+      setCurrentWorkflowName(def.name ?? "");
       const workflow = def.workflow;
       const flowNodes = workflow.nodes.map((node, index) => ({
         id: node.id,
@@ -512,11 +536,83 @@ export default function App() {
     });
   }
 
-  function saveDeepSeekConfig() {
+  function computeNodesWithUpdatedMeta(nodeId: string, nextData: WorkflowNodeMeta["data"]): FlowNode[] {
+    return nodes.map((node) => {
+      if (node.id !== nodeId) return node;
+      const prevMeta = (node as unknown as { meta?: WorkflowNodeMeta }).meta;
+      const mergedMeta: WorkflowNodeMeta = {
+        id: nodeId,
+        type: prevMeta?.type ?? ((node.data as unknown as { nodeType?: NodeType }).nodeType ?? "input"),
+        data: {
+          ...(prevMeta?.data ?? {}),
+          ...(nextData ?? {})
+        }
+      };
+      return {
+        ...node,
+        meta: mergedMeta,
+        data: {
+          ...node.data,
+          label: mergedMeta.data?.name ?? node.data.label
+        }
+      };
+    });
+  }
+
+  function buildWorkflowPayloadFromNodes(nextNodes: FlowNode[]) {
+    return {
+      nodes: nextNodes.map((node) => {
+        const meta = (node as unknown as { meta?: WorkflowNodeMeta }).meta;
+        if (meta) return meta;
+        return {
+          id: node.id,
+          type: (node.data as unknown as { nodeType?: NodeType }).nodeType ?? "input",
+          data: {
+            name: (node.data as unknown as { label?: string }).label ?? node.id
+          }
+        } satisfies WorkflowNodeMeta;
+      }),
+      edges: edges.map(({ id, source, target }) => ({ id, source, target }))
+    };
+  }
+
+  async function upsertWorkflowToDb(workflowName: string, workflow: ReturnType<typeof buildWorkflowPayloadFromNodes>) {
+    if (!token) {
+      alert("请先登录/加载工作流");
+      return null;
+    }
+    const isUpdate = currentWorkflowId != null;
+    const url = `${API_BASE}/api/workflows${isUpdate ? `/${currentWorkflowId}` : ""}`;
+    const method = isUpdate ? "PUT" : "POST";
+    const resp = await fetch(url, {
+      method,
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        name: workflowName,
+        workflow,
+        draft: true,
+        published: false
+      })
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(text || `upsert workflow failed: ${resp.status}`);
+    }
+    const saved = (await resp.json()) as { id?: number; name?: string };
+    if (saved.id != null) {
+      setCurrentWorkflowId(saved.id);
+      localStorage.setItem("walnutAgent.currentWorkflowId", String(saved.id));
+    }
+    setCurrentWorkflowName(saved.name ?? workflowName);
+    return saved.id ?? null;
+  }
+
+  async function saveDeepSeekConfig() {
     if (!selectedNode) return;
     const baseUrl = deepSeekConfig.baseUrl.trim();
     if (!baseUrl) {
       alert("DeepSeek 模型接口地址为必填项");
+      showConfigSaveFeedback("error", "DeepSeek 配置保存失败：baseUrl 必填");
       return;
     }
     const payload: WorkflowNodeMeta["data"] = {
@@ -531,20 +627,37 @@ export default function App() {
       inputParams: deepSeekConfig.inputParams,
       outputParams: deepSeekConfig.outputParams
     };
-    persistSelectedNodeData(selectedNode.id, payload);
-    setLogs((prev) => [...prev, `[CONFIG] DeepSeek config saved for ${selectedNode.id}`]);
+    const nextNodes = computeNodesWithUpdatedMeta(selectedNode.id, payload);
+    setNodes(nextNodes);
+    setSelectedNode((prev) => {
+      if (!prev || prev.id !== selectedNode.id) return prev;
+      return { ...prev, data: { ...(prev.data ?? {}), ...(payload ?? {}) } };
+    });
+    const nextWorkflowPayload = buildWorkflowPayloadFromNodes(nextNodes);
+    const workflowName = currentWorkflowName || `workflow-${Date.now()}`;
+    try {
+      await upsertWorkflowToDb(workflowName, nextWorkflowPayload);
+      setLogs((prev) => [...prev, `[CONFIG] DeepSeek config saved for ${selectedNode.id}`]);
+      showConfigSaveFeedback("success", "DeepSeek 配置已保存并落库");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setLogs((prev) => [...prev, `[CONFIG] DeepSeek config save failed: ${msg}`]);
+      showConfigSaveFeedback("error", `DeepSeek 配置保存失败：${msg}`);
+    }
   }
 
-  function saveQwenConfig() {
+  async function saveQwenConfig() {
     if (!selectedNode) return;
     const baseUrl = qwenConfig.baseUrl.trim();
     if (!baseUrl) {
       alert("请填写 DashScope 兼容模式 API 根地址");
+      showConfigSaveFeedback("error", "通义千问配置保存失败：baseUrl 必填");
       return;
     }
     const model = qwenConfig.model.trim();
     if (!model) {
       alert("请选择或填写模型名称（如 qwen-plus）");
+      showConfigSaveFeedback("error", "通义千问配置保存失败：model 必填");
       return;
     }
     const payload: WorkflowNodeMeta["data"] = {
@@ -559,8 +672,23 @@ export default function App() {
       inputParams: qwenConfig.inputParams,
       outputParams: qwenConfig.outputParams
     };
-    persistSelectedNodeData(selectedNode.id, payload);
-    setLogs((prev) => [...prev, `[CONFIG] 通义千问 config saved for ${selectedNode.id}`]);
+    const nextNodes = computeNodesWithUpdatedMeta(selectedNode.id, payload);
+    setNodes(nextNodes);
+    setSelectedNode((prev) => {
+      if (!prev || prev.id !== selectedNode.id) return prev;
+      return { ...prev, data: { ...(prev.data ?? {}), ...(payload ?? {}) } };
+    });
+    const nextWorkflowPayload = buildWorkflowPayloadFromNodes(nextNodes);
+    const workflowName = currentWorkflowName || `workflow-${Date.now()}`;
+    try {
+      await upsertWorkflowToDb(workflowName, nextWorkflowPayload);
+      setLogs((prev) => [...prev, `[CONFIG] 通义千问 config saved for ${selectedNode.id}`]);
+      showConfigSaveFeedback("success", "通义千问配置已保存并落库");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setLogs((prev) => [...prev, `[CONFIG] 通义千问 config save failed: ${msg}`]);
+      showConfigSaveFeedback("error", `通义千问配置保存失败：${msg}`);
+    }
   }
 
   async function handleDebug(): Promise<void> {
@@ -596,15 +724,43 @@ export default function App() {
       } else if (message.type === "NODE_START") {
         const nodeId = (payload as any).nodeId as string;
         const nodeType = (payload as any).nodeType as NodeType;
+        const inputPayload = (payload as any).inputPayload as string | undefined;
+        const rawRequestPayload = (payload as any).rawRequestPayload as string | undefined;
         setLiveNodeResults((prev) => {
           if (prev.find((p) => p.nodeId === nodeId)) return prev;
-          return [...prev, { nodeId, nodeType, status: "RUNNING", durationMs: null, text: null, errorCode: null }];
+          return [
+            ...prev,
+            {
+              nodeId,
+              nodeType,
+              status: "RUNNING",
+              durationMs: null,
+              text: null,
+              errorCode: null,
+              inputPayload: inputPayload ?? null,
+              outputPayload: null,
+              rawRequestPayload: rawRequestPayload ?? null,
+              rawResponsePayload: null
+            }
+          ];
         });
       } else if (message.type === "NODE_SUCCESS") {
         const nodeId = (payload as any).nodeId as string;
         const text = (payload as any).text as string | undefined;
+        const outputPayload = (payload as any).outputPayload as string | undefined;
+        const rawResponsePayload = (payload as any).rawResponsePayload as string | undefined;
         setLiveNodeResults((prev) =>
-          prev.map((n) => (n.nodeId === nodeId ? { ...n, status: "SUCCESS", text: text ?? n.text } : n))
+          prev.map((n) =>
+            n.nodeId === nodeId
+              ? {
+                  ...n,
+                  status: "SUCCESS",
+                  text: text ?? n.text,
+                  outputPayload: outputPayload ?? n.outputPayload,
+                  rawResponsePayload: rawResponsePayload ?? n.rawResponsePayload
+                }
+              : n
+          )
         );
       } else if (message.type === "NODE_ERROR") {
         const nodeId = (payload as any).nodeId as string;
@@ -676,10 +832,12 @@ export default function App() {
     }
     const name = window.prompt("请输入工作流名称", `workflow-${Date.now()}`);
     if (!name) return;
+    setCurrentWorkflowName(name);
     setSaving(true);
     try {
-      const resp = await fetch(`${API_BASE}/api/workflows`, {
-        method: "POST",
+      const isUpdate = currentWorkflowId != null;
+      const resp = await fetch(`${API_BASE}/api/workflows${isUpdate ? `/${currentWorkflowId}` : ""}`, {
+        method: isUpdate ? "PUT" : "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`
@@ -695,7 +853,7 @@ export default function App() {
         const text = await resp.text().catch(() => "");
         throw new Error(text || `save failed: ${resp.status}`);
       }
-      const saved = (await resp.json()) as { id?: number };
+      const saved = (await resp.json()) as { id?: number } & { name?: string };
       const savedId = saved.id ?? null;
       setLogs((prev) => [...prev, `[SAVE] ok id=${savedId ?? "-"}`]);
       if (savedId) {
@@ -1076,7 +1234,21 @@ export default function App() {
                     <input type="checkbox" checked readOnly />
                     <span>必要</span>
                   </label>
-                  <button className="save-config-btn">保存配置</button>
+                  <button
+                    className="save-config-btn"
+                    onClick={() => showConfigSaveFeedback("success", "输入节点无需额外配置")}
+                  >
+                    保存配置
+                  </button>
+                  {configSaveFeedback && (
+                    <div
+                      className={`config-save-feedback ${
+                        configSaveFeedback.kind === "success" ? "success" : "error"
+                      }`}
+                    >
+                      {configSaveFeedback.text}
+                    </div>
+                  )}
                 </>
               ) : selectedNode.type === "output" ? (
                 <>
@@ -1147,7 +1319,21 @@ export default function App() {
                     value={selectedOutputTemplate}
                     onChange={(e) => setOutputTemplates((prev) => ({ ...prev, [selectedNode.id]: e.target.value }))}
                   />
-                  <button className="save-config-btn">保存配置</button>
+                  <button
+                    className="save-config-btn"
+                    onClick={() => showConfigSaveFeedback("success", "输出配置已更新（当前版本仅用于调试展示）")}
+                  >
+                    保存配置
+                  </button>
+                  {configSaveFeedback && (
+                    <div
+                      className={`config-save-feedback ${
+                        configSaveFeedback.kind === "success" ? "success" : "error"
+                      }`}
+                    >
+                      {configSaveFeedback.text}
+                    </div>
+                  )}
                 </>
               ) : isQwenNode ? (
                 <>
@@ -1324,9 +1510,18 @@ export default function App() {
                   <div className="temp-tip">
                     当前值：{qwenConfig.temperature.toFixed(1)}。温度越低越严谨，越高越发散。
                   </div>
-                  <button className="save-config-btn" onClick={saveQwenConfig}>
+                  <button className="save-config-btn" onClick={() => void saveQwenConfig()}>
                     保存配置
                   </button>
+                  {configSaveFeedback && (
+                    <div
+                      className={`config-save-feedback ${
+                        configSaveFeedback.kind === "success" ? "success" : "error"
+                      }`}
+                    >
+                      {configSaveFeedback.text}
+                    </div>
+                  )}
                 </>
               ) : isDeepSeekNode ? (
                 <>
@@ -1463,9 +1658,18 @@ export default function App() {
                   <div className="temp-tip">
                     当前值：{deepSeekConfig.temperature.toFixed(1)}。温度越低越严谨，越高越发散。
                   </div>
-                  <button className="save-config-btn" onClick={saveDeepSeekConfig}>
+                  <button className="save-config-btn" onClick={() => void saveDeepSeekConfig()}>
                     保存配置
                   </button>
+                  {configSaveFeedback && (
+                    <div
+                      className={`config-save-feedback ${
+                        configSaveFeedback.kind === "success" ? "success" : "error"
+                      }`}
+                    >
+                      {configSaveFeedback.text}
+                    </div>
+                  )}
                 </>
               ) : (
                 <>
@@ -1477,7 +1681,9 @@ export default function App() {
                   </div>
                   <label className="config-label">回答内容配置</label>
                   <textarea className="config-area" value="{{output}}" readOnly />
-                  <button className="save-config-btn">保存配置</button>
+                  <button className="save-config-btn" onClick={() => showConfigSaveFeedback("success", "输出配置已更新（当前版本仅用于调试展示）")}>
+                    保存配置
+                  </button>
                 </>
               )}
             </div>
@@ -1558,19 +1764,42 @@ export default function App() {
                 {executionError ? <div className="exec-error">错误: {executionError}</div> : null}
               </div>
 
-              <div className="exec-nodes-head">
-                节点执行状态（{liveNodeResults.length}）
-              </div>
+              <div className="exec-nodes-head">节点执行详情（{liveNodeResults.length}）</div>
               <div className="exec-nodes">
                 {liveNodeResults.length ? (
                   liveNodeResults.map((n) => (
-                    <div key={n.nodeId} className="exec-node-row">
-                      <span className={`exec-node-dot ${n.status === "SUCCESS" ? "ok" : n.status === "FAILED" ? "bad" : ""}`}>
-                        {n.status === "SUCCESS" ? "✓" : n.status === "FAILED" ? "×" : n.status === "RUNNING" ? "..." : "?"}
-                      </span>
-                      <span className="exec-node-type">{n.nodeType}</span>
-                      <span className="exec-node-status">{n.status}</span>
-                      {n.durationMs != null ? <span className="exec-node-dur">{n.durationMs}ms</span> : null}
+                    <div key={n.nodeId} className="exec-node-card">
+                      <div className="exec-node-row">
+                        <span className={`exec-node-dot ${n.status === "SUCCESS" ? "ok" : n.status === "FAILED" ? "bad" : ""}`}>
+                          {n.status === "SUCCESS" ? "✓" : n.status === "FAILED" ? "×" : n.status === "RUNNING" ? "..." : "?"}
+                        </span>
+                        <span className="exec-node-type">{n.nodeType}</span>
+                        <span className="exec-node-status">{n.status}</span>
+                        {n.durationMs != null ? <span className="exec-node-dur">{n.durationMs}ms</span> : null}
+                      </div>
+                      <div className="exec-node-io">
+                        <div className="exec-io-row">
+                          <div>输入数据:</div>
+                          <pre className="io-pre">{n.inputPayload || "-"}</pre>
+                        </div>
+                        <div className="exec-io-row">
+                          <div>输出数据:</div>
+                          <pre className="io-pre">{n.outputPayload || n.text || "-"}</pre>
+                        </div>
+                        {(n.rawRequestPayload || n.rawResponsePayload) && (
+                          <details className="exec-raw">
+                            <summary>查看 Raw 请求/响应</summary>
+                            <div className="exec-io-row">
+                              <div>Raw 请求:</div>
+                              <pre className="io-pre">{n.rawRequestPayload || "-"}</pre>
+                            </div>
+                            <div className="exec-io-row">
+                              <div>Raw 响应:</div>
+                              <pre className="io-pre">{n.rawResponsePayload || "-"}</pre>
+                            </div>
+                          </details>
+                        )}
+                      </div>
                     </div>
                   ))
                 ) : (

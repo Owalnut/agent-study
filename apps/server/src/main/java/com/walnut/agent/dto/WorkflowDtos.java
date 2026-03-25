@@ -77,6 +77,10 @@ public class WorkflowDtos {
             String status,
             Long durationMs,
             String text,
-            String errorCode
+            String errorCode,
+            String inputPayload,
+            String outputPayload,
+            String rawRequestPayload,
+            String rawResponsePayload
     ) {}
 }
