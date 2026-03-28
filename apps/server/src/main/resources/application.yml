@@ -5,7 +5,7 @@ spring:
   datasource:
     url: jdbc:mysql://localhost:3306/demo_agent?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
     username: root
-    password: 123456
+    password: 20041027Djs
     driver-class-name: com.mysql.cj.jdbc.Driver
   jackson:
     default-property-inclusion: non_null
@@ -31,3 +31,14 @@ workflow:
   retry-times: 1
   retry-backoff-ms: 200
   retry-backoff-multiplier: 2
+
+# TTS 音频上传后 voice_url 默认使用预签名 GET（私有桶可播）。若需无参数直链，可开启下面策略或手动在 MinIO 控制台设为 public
+minio:
+  enabled: true
+  endpoint: http://localhost:9000
+  access-key: admin
+  secret-key: admin123
+  bucket-name: walnut-agent
+  public-url: http://localhost:9000
+  presigned-url-expiry-seconds: 604800
+  apply-public-read-policy-on-startup: true

@@ -35,7 +35,26 @@ type WorkflowNodeMeta = {
   };
 };
 type WorkflowEdge = { id: string; source: string; target: string };
-type Workflow = { nodes: WorkflowNodeMeta[]; edges: WorkflowEdge[] };
+/** 随工作流落库的调试区与输出面板状态 */
+type WorkflowDebugPersist = {
+  inputText?: string;
+  debugOpen?: boolean;
+  debugDrawerHeight?: number;
+  /** 保存时关联的最近一次执行，加载时可还原调试结果 */
+  lastExecutionId?: number | null;
+};
+type WorkflowOutputUi = {
+  templates?: Record<string, string>;
+  configs?: Record<string, OutputParam[]>;
+};
+type Workflow = {
+  nodes: WorkflowNodeMeta[];
+  edges: WorkflowEdge[];
+  debug?: WorkflowDebugPersist;
+  outputUi?: WorkflowOutputUi;
+};
+
+const DEFAULT_DEBUG_INPUT = "你好，帮我生成一期关于 AI Agent 的播客开场白。";
 type DebugOutput = { text?: string; audioBase64?: string; contentType?: string };
 type WsEvent = { type: string; executionId?: number; payload?: Record<string, unknown> };
 type OutputParamType = "input" | "reference";
@@ -139,7 +158,7 @@ export default function App() {
   const [debugOpen, setDebugOpen] = useState(true);
   const [debugDrawerHeight, setDebugDrawerHeight] = useState(320);
   const [isResizingDebugDrawer, setIsResizingDebugDrawer] = useState(false);
-  const [debugInput, setDebugInput] = useState("你好，帮我生成一期关于 AI Agent 的播客开场白。");
+  const [debugInput, setDebugInput] = useState(DEFAULT_DEBUG_INPUT);
   const [debugResult, setDebugResult] = useState<DebugOutput | null>(null);
   const [loading, setLoading] = useState(false);
   const [currentWorkflowId, setCurrentWorkflowId] = useState<number | null>(null);
@@ -236,6 +255,31 @@ export default function App() {
     };
   }, [isResizingDebugDrawer, debugOpen]);
 
+  function applyWorkflowPersistedUi(wf: Workflow) {
+    const d = wf.debug;
+    if (d?.inputText !== undefined && d?.inputText !== null) {
+      setDebugInput(d.inputText);
+    }
+    if (typeof d?.debugOpen === "boolean") {
+      setDebugOpen(d.debugOpen);
+    }
+    if (typeof d?.debugDrawerHeight === "number" && d.debugDrawerHeight >= DEBUG_DRAWER_MIN_HEIGHT) {
+      const maxHeight = Math.floor(window.innerHeight * DEBUG_DRAWER_MAX_HEIGHT_RATIO);
+      setDebugDrawerHeight(Math.min(d.debugDrawerHeight, maxHeight));
+    }
+    const oui = wf.outputUi;
+    if (oui?.templates && typeof oui.templates === "object") {
+      setOutputTemplates({ ...oui.templates });
+    } else {
+      setOutputTemplates({});
+    }
+    if (oui?.configs && typeof oui.configs === "object") {
+      setOutputConfigs({ ...oui.configs } as Record<string, OutputParam[]>);
+    } else {
+      setOutputConfigs({});
+    }
+  }
+
   async function loginAndLoad(): Promise<void> {
     const loginResp = await fetch(`${API_BASE}/api/auth/login`, {
       method: "POST",
@@ -282,8 +326,14 @@ export default function App() {
     if (raw.workflowId) {
       localStorage.setItem("walnutAgent.currentWorkflowId", String(raw.workflowId));
     }
+    applyWorkflowPersistedUi(raw);
     if (raw.workflowId) {
-      await loadLatestExecution(raw.workflowId, nextToken);
+      const leid = raw.debug?.lastExecutionId;
+      if (typeof leid === "number" && leid > 0) {
+        await loadExecutionById(leid, nextToken);
+      } else {
+        await loadLatestExecution(raw.workflowId, nextToken);
+      }
     } else {
       setLatestExecution(null);
       setLiveNodeResults([]);
@@ -299,6 +349,9 @@ export default function App() {
     setSelectedNode(null);
     setOutputConfigs({});
     setOutputTemplates({});
+    setDebugInput(DEFAULT_DEBUG_INPUT);
+    setDebugOpen(true);
+    setDebugDrawerHeight(320);
     setCurrentWorkflowId(null);
     setCurrentWorkflowName("");
     localStorage.removeItem("walnutAgent.currentWorkflowId");
@@ -385,12 +438,16 @@ export default function App() {
       setNodes(flowNodes);
       setEdges(flowEdges);
       setSelectedNode(null);
-      setOutputConfigs({});
-      setOutputTemplates({});
       setCurrentWorkflowId(workflowId);
       localStorage.setItem("walnutAgent.currentWorkflowId", String(workflowId));
       setLoadModalOpen(false);
-      await loadLatestExecution(workflowId, authToken);
+      applyWorkflowPersistedUi(workflow);
+      const leid = workflow.debug?.lastExecutionId;
+      if (typeof leid === "number" && leid > 0) {
+        await loadExecutionById(leid, authToken);
+      } else {
+        await loadLatestExecution(workflowId, authToken);
+      }
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));
     }
@@ -424,12 +481,11 @@ export default function App() {
     }
   }
 
-  const workflowPayload = useMemo(
-    () => ({
-      nodes: nodes.map((node) => {
+  function buildPersistedWorkflowPayload(nextNodes: FlowNode[] = nodes): Workflow {
+    return {
+      nodes: nextNodes.map((node) => {
         const meta = (node as unknown as { meta?: WorkflowNodeMeta }).meta;
         if (meta) return meta;
-        // 兜底：如果自定义字段 meta 在某些更新流程中丢失，用 data 反推
         return {
           id: node.id,
           type: (node.data as unknown as { nodeType?: NodeType }).nodeType ?? "input",
@@ -438,9 +494,23 @@ export default function App() {
           }
         } satisfies WorkflowNodeMeta;
       }),
-      edges: edges.map(({ id, source, target }) => ({ id, source, target }))
-    }),
-    [nodes, edges]
+      edges: edges.map(({ id, source, target }) => ({ id, source, target })),
+      debug: {
+        inputText: debugInput,
+        debugOpen,
+        debugDrawerHeight,
+        lastExecutionId: latestExecution?.id ?? null
+      },
+      outputUi: {
+        templates: { ...outputTemplates },
+        configs: { ...outputConfigs }
+      }
+    };
+  }
+
+  const workflowPayload = useMemo(
+    () => buildPersistedWorkflowPayload(),
+    [nodes, edges, debugInput, debugOpen, debugDrawerHeight, outputTemplates, outputConfigs, latestExecution?.id]
   );
 
   const selectedOutputParams = selectedNode && selectedNode.type === "output" ? outputConfigs[selectedNode.id] || [] : [];
@@ -646,24 +716,7 @@ export default function App() {
     });
   }
 
-  function buildWorkflowPayloadFromNodes(nextNodes: FlowNode[]) {
-    return {
-      nodes: nextNodes.map((node) => {
-        const meta = (node as unknown as { meta?: WorkflowNodeMeta }).meta;
-        if (meta) return meta;
-        return {
-          id: node.id,
-          type: (node.data as unknown as { nodeType?: NodeType }).nodeType ?? "input",
-          data: {
-            name: (node.data as unknown as { label?: string }).label ?? node.id
-          }
-        } satisfies WorkflowNodeMeta;
-      }),
-      edges: edges.map(({ id, source, target }) => ({ id, source, target }))
-    };
-  }
-
-  async function upsertWorkflowToDb(workflowName: string, workflow: ReturnType<typeof buildWorkflowPayloadFromNodes>) {
+  async function upsertWorkflowToDb(workflowName: string, workflow: Workflow) {
     if (!token) {
       alert("请先登录/加载工作流");
       return null;
@@ -720,7 +773,7 @@ export default function App() {
       if (!prev || prev.id !== selectedNode.id) return prev;
       return { ...prev, data: { ...(prev.data ?? {}), ...(payload ?? {}) } };
     });
-    const nextWorkflowPayload = buildWorkflowPayloadFromNodes(nextNodes);
+    const nextWorkflowPayload = buildPersistedWorkflowPayload(nextNodes);
     const workflowName = currentWorkflowName || `workflow-${Date.now()}`;
     try {
       await upsertWorkflowToDb(workflowName, nextWorkflowPayload);
@@ -765,7 +818,7 @@ export default function App() {
       if (!prev || prev.id !== selectedNode.id) return prev;
       return { ...prev, data: { ...(prev.data ?? {}), ...(payload ?? {}) } };
     });
-    const nextWorkflowPayload = buildWorkflowPayloadFromNodes(nextNodes);
+    const nextWorkflowPayload = buildPersistedWorkflowPayload(nextNodes);
     const workflowName = currentWorkflowName || `workflow-${Date.now()}`;
     try {
       await upsertWorkflowToDb(workflowName, nextWorkflowPayload);
@@ -823,7 +876,7 @@ export default function App() {
       if (!prev || prev.id !== selectedNode.id) return prev;
       return { ...prev, data: { ...(prev.data ?? {}), ...(payload ?? {}) } };
     });
-    const nextWorkflowPayload = buildWorkflowPayloadFromNodes(nextNodes);
+    const nextWorkflowPayload = buildPersistedWorkflowPayload(nextNodes);
     const workflowName = currentWorkflowName || `workflow-${Date.now()}`;
     try {
       await upsertWorkflowToDb(workflowName, nextWorkflowPayload);
@@ -1004,11 +1057,6 @@ export default function App() {
       if (savedId) {
         setCurrentWorkflowId(savedId);
         localStorage.setItem("walnutAgent.currentWorkflowId", String(savedId));
-        setLatestExecution(null);
-        setLiveNodeResults([]);
-        setExecutionStatus("");
-        setExecutionError(null);
-        setDebugResult(null);
       }
       setDebugOpen(true);
     } catch (e) {

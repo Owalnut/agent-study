@@ -41,12 +41,14 @@ public class WorkflowService {
     private final long retryBackoffMs;
     private final int retryBackoffMultiplier;
     private final ChatClientFactory chatClientFactory;
+    private final MinioStorageService minioStorageService;
     private final HttpClient httpClient;
 
     public WorkflowService(
             WorkflowDefinitionMapper definitionMapper,
             WorkflowExecutionMapper executionMapper,
             ChatClientFactory chatClientFactory,
+            MinioStorageService minioStorageService,
             ObjectMapper objectMapper,
             @Value("${workflow.node-timeout-ms}") int nodeTimeoutMs,
             @Value("${workflow.retry-times}") int retryTimes,
@@ -56,6 +58,7 @@ public class WorkflowService {
         this.definitionMapper = definitionMapper;
         this.executionMapper = executionMapper;
         this.chatClientFactory = chatClientFactory;
+        this.minioStorageService = minioStorageService;
         this.objectMapper = objectMapper;
         this.nodeTimeoutMs = nodeTimeoutMs;
         this.retryTimes = retryTimes;
@@ -361,7 +364,8 @@ public class WorkflowService {
                             return runWithTimeout(new Callable<Map<String, String>>() {
                                 @Override
                                 public Map<String, String> call() throws Exception {
-                                    return callDashScopeTts(apiKey, model, ttsText, ttsVoice, ttsLanguageType);
+                                    Map<String, String> raw = callDashScopeTts(apiKey, model, ttsText, ttsVoice, ttsLanguageType);
+                                    return mirrorTtsToMinio(raw, apiKey, executionId);
                                 }
                             });
                         }
@@ -586,7 +590,8 @@ public class WorkflowService {
                                 || "LLM_EMPTY_RESPONSE".equals(wne.code())
                                 || "LLM_RESPONSE_PARSE_ERROR".equals(wne.code())
                                 || "TTS_PROVIDER_ERROR".equals(wne.code())
-                                || "TTS_EMPTY_RESPONSE".equals(wne.code()))) {
+                                || "TTS_EMPTY_RESPONSE".equals(wne.code())
+                                || "MINIO_UPLOAD_ERROR".equals(wne.code()))) {
                     throw wne;
                 }
                 last = e;
@@ -739,6 +744,70 @@ public class WorkflowService {
             pcm[i * 2 + 1] = (byte) ((value >> 8) & 0xff);
         }
         return wavWrap(pcm, sampleRate, 1, 16);
+    }
+
+    /**
+     * 将百炼返回的音频写入 MinIO，并把 {@code voice_url} 换成 {@code public-url} 下的可访问地址。
+     * 未启用 MinIO 或上传跳过时保持百炼原始 {@code voice_url}。
+     */
+    private Map<String, String> mirrorTtsToMinio(Map<String, String> raw, String apiKey, Long executionId) {
+        try {
+            byte[] bytes = fetchTtsAudioBytes(raw, apiKey);
+            if (bytes == null || bytes.length == 0) {
+                log.warn("TTS mirror skipped: no audio bytes (check DashScope response)");
+                return raw;
+            }
+            String ct = raw.getOrDefault("contentType", "audio/wav");
+            String minioUrl = minioStorageService.uploadTtsAudio(bytes, ct, executionId);
+            if (minioUrl == null) {
+                return raw;
+            }
+            Map<String, String> out = new HashMap<>(raw);
+            out.put("voice_url", minioUrl);
+            out.put("audioBase64", Base64.getEncoder().encodeToString(bytes));
+            log.info("TTS audio stored in MinIO: {}", minioUrl);
+            return out;
+        } catch (WorkflowNodeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new WorkflowNodeException("MINIO_UPLOAD_ERROR", "FAILED", "MinIO upload failed: " + getRootMessage(e), e);
+        }
+    }
+
+    /** 优先用响应里的 base64；否则用百炼返回的 URL 拉取音频（必要时带 Bearer）。 */
+    private byte[] fetchTtsAudioBytes(Map<String, String> ttsResult, String apiKey) throws Exception {
+        String b64 = ttsResult.get("audioBase64");
+        if (b64 != null && !b64.isBlank()) {
+            try {
+                return Base64.getDecoder().decode(b64);
+            } catch (IllegalArgumentException e) {
+                log.warn("Invalid TTS audio base64, will try URL download");
+            }
+        }
+        String url = ttsResult.get("voice_url");
+        if (url == null || url.isBlank()) {
+            return null;
+        }
+        HttpRequest req = HttpRequest.newBuilder().uri(URI.create(url.trim())).GET().build();
+        HttpResponse<byte[]> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofByteArray());
+        if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
+            return resp.body();
+        }
+        HttpRequest reqAuth = HttpRequest.newBuilder()
+                .uri(URI.create(url.trim()))
+                .header("Authorization", "Bearer " + apiKey.trim())
+                .GET()
+                .build();
+        HttpResponse<byte[]> respAuth = httpClient.send(reqAuth, HttpResponse.BodyHandlers.ofByteArray());
+        if (respAuth.statusCode() >= 200 && respAuth.statusCode() < 300) {
+            return respAuth.body();
+        }
+        throw new WorkflowNodeException(
+                "TTS_PROVIDER_ERROR",
+                "FAILED",
+                "Failed to download TTS audio from url: HTTP " + respAuth.statusCode(),
+                null
+        );
     }
 
     private Map<String, String> callDashScopeTts(
